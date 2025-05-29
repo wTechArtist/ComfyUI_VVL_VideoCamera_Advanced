@@ -5,3 +5,4 @@ Pillow
 huggingface_hub
 einops
 safetensors
+pydantic==2.10.6
