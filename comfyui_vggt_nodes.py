@@ -1,7 +1,8 @@
 import os
 import json
 import tempfile
-from typing import List, Any
+from typing import List, Any, Dict
+import logging
 
 import cv2
 import numpy as np
@@ -18,14 +19,25 @@ except ImportError:
 
 # 导入 VGGT 相关函数
 try:
-    from vggt.models.vggt import VGGT
     from vggt.utils.load_fn import load_and_preprocess_images
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+    VGGT_UTILS_AVAILABLE = True
 except Exception as e:
-    VGGT = None
-    _VGGT_IMPORT_ERROR = e
-else:
-    _VGGT_IMPORT_ERROR = None
+    load_and_preprocess_images = None
+    pose_encoding_to_extri_intri = None
+    VGGT_UTILS_AVAILABLE = False
+    _VGGT_UTILS_IMPORT_ERROR = e
+
+# 导入模型加载器
+try:
+    from .vggt_model_loader import VVLVGGTLoader
+    MODEL_LOADER_AVAILABLE = True
+except ImportError:
+    VVLVGGTLoader = None
+    MODEL_LOADER_AVAILABLE = False
+
+# 配置日志
+logger = logging.getLogger('vvl_vggt_nodes')
 
 # -----------------------------------------------------------------------------
 # 工具函数
@@ -73,7 +85,7 @@ def _matrices_to_json(intrinsic, extrinsic) -> (str, str):
     )
 
 def _create_traj_preview(extrinsic: torch.Tensor) -> torch.Tensor:
-    """根据相机外参创建3D轨迹可视化 (返回 1xHxWxC)。"""
+    """根据相机外参创建3D轨迹可视化（使用matplotlib 3D绘图）。"""
     ext = extrinsic.cpu().numpy()  # (N,3,4)
     positions = []
     orientations = []
@@ -81,46 +93,203 @@ def _create_traj_preview(extrinsic: torch.Tensor) -> torch.Tensor:
     for mat in ext:
         R = mat[:3, :3]
         t = mat[:3, 3]
-        pos = -R.T @ t
+        pos = -R.T @ t  # 相机在世界坐标系中的位置
         positions.append(pos)
         # 提取相机朝向（Z轴方向）
-        forward = R[:, 2]  # 相机朝向
+        forward = -R[:, 2]  # 相机朝向（Z轴负方向）
         orientations.append(forward)
     
     positions = np.array(positions)
     orientations = np.array(orientations)
     
     if positions.shape[0] < 2:
-        # 少于两帧给提示图
         return _create_insufficient_data_image()
 
-    # 创建组合视图：顶视图 + 侧视图 + 3D投影
-    canvas_width, canvas_height = 800, 600
-    canvas = np.ones((canvas_height, canvas_width, 3), dtype=np.float32) * 0.95
+    try:
+        # 使用matplotlib创建3D立体可视化
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+        
+        fig = plt.figure(figsize=(12, 9))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # 绘制轨迹线
+        if len(positions) > 1:
+            ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], 
+                   'b-', linewidth=3, alpha=0.8, label='Camera Path')
+        
+        # 用颜色渐变表示时间进程
+        colors = plt.cm.viridis(np.linspace(0, 1, len(positions)))
+        scatter = ax.scatter(positions[:, 0], positions[:, 1], positions[:, 2], 
+                           c=colors, s=60, alpha=0.9, edgecolors='black', linewidth=0.5)
+        
+        # 标记起点和终点
+        if len(positions) > 0:
+            ax.scatter([positions[0, 0]], [positions[0, 1]], [positions[0, 2]], 
+                      c='green', s=150, marker='^', label='Start', edgecolors='darkgreen', linewidth=2)
+        if len(positions) > 1:
+            ax.scatter([positions[-1, 0]], [positions[-1, 1]], [positions[-1, 2]], 
+                      c='red', s=150, marker='o', label='End', edgecolors='darkred', linewidth=2)
+        
+        # 添加相机方向指示器（每几个位姿显示一个）
+        step = max(1, len(positions) // 10)
+        for i in range(0, len(positions), step):
+            pos = positions[i]
+            direction = orientations[i]
+            
+            # 计算方向向量长度
+            direction_length = max(0.5, np.linalg.norm(positions.max(axis=0) - positions.min(axis=0)) * 0.1)
+            direction_scaled = direction * direction_length
+            
+            ax.quiver(pos[0], pos[1], pos[2], 
+                     direction_scaled[0], direction_scaled[1], direction_scaled[2], 
+                     color='orange', alpha=0.6, arrow_length_ratio=0.1)
+        
+        # 设置坐标轴
+        ax.set_xlabel('X (meters)', fontsize=12)
+        ax.set_ylabel('Y (meters)', fontsize=12)
+        ax.set_zlabel('Z (meters)', fontsize=12)
+        ax.set_title('VGGT Camera Trajectory (3D View)', fontsize=14, fontweight='bold')
+        
+        # 添加图例
+        ax.legend(loc='upper right', fontsize=10)
+        
+        # 添加颜色条
+        cbar = plt.colorbar(scatter, ax=ax, shrink=0.6, aspect=20)
+        cbar.set_label('Time Progress', fontsize=10)
+        
+        # 设置相等的坐标轴比例
+        max_range = np.array([positions.max(axis=0) - positions.min(axis=0)]).max() / 2.0
+        mid_x = (positions.max(axis=0)[0] + positions.min(axis=0)[0]) * 0.5
+        mid_y = (positions.max(axis=0)[1] + positions.min(axis=0)[1]) * 0.5
+        mid_z = (positions.max(axis=0)[2] + positions.min(axis=0)[2]) * 0.5
+        
+        ax.set_xlim(mid_x - max_range, mid_x + max_range)
+        ax.set_ylim(mid_y - max_range, mid_y + max_range)
+        ax.set_zlim(mid_z - max_range, mid_z + max_range)
+        
+        # 设置网格
+        ax.grid(True, alpha=0.3)
+        
+        # 调整视角
+        ax.view_init(elev=20, azim=45)
+        
+        # 保存为图像
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+            plt.savefig(tmp.name, dpi=120, bbox_inches='tight', facecolor='white')
+            plt.close()
+            
+            # 读取图像
+            img = cv2.imread(tmp.name)
+            os.unlink(tmp.name)
+            
+            if img is not None:
+                # BGR转RGB
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                # 转换为torch tensor
+                img_tensor = torch.from_numpy(img.astype(np.float32) / 255.0)
+                print(f"VGGT: 成功创建3D轨迹可视化，图像尺寸: {img.shape}")
+                return img_tensor.unsqueeze(0)
+            else:
+                print("VGGT: 读取生成的可视化图像失败")
+                return _create_insufficient_data_image()
     
-    # 绘制标题
-    cv2.putText(canvas, "VGGT Camera Trajectory Analysis", (20, 30), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0.1, 0.1, 0.1), 2)
+    except Exception as e:
+        print(f"VGGT: 创建3D可视化失败: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # 如果3D可视化失败，创建备用的2D可视化
+        return _create_fallback_2d_visualization_vggt(positions, orientations)
+
+def _create_fallback_2d_visualization_vggt(positions: np.ndarray, orientations: np.ndarray) -> torch.Tensor:
+    """创建VGGT备用2D可视化（当3D可视化失败时使用）"""
+    try:
+        import matplotlib.pyplot as plt
+        
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
+        fig.suptitle('VGGT Camera Trajectory (2D Views)', fontsize=16, fontweight='bold')
+        
+        # XY视图（俯视图）
+        if len(positions) > 1:
+            ax1.plot(positions[:, 0], positions[:, 1], 'b-', linewidth=2, alpha=0.7)
+        colors = plt.cm.viridis(np.linspace(0, 1, len(positions)))
+        ax1.scatter(positions[:, 0], positions[:, 1], c=colors, s=50, alpha=0.8, edgecolors='black')
+        if len(positions) > 0:
+            ax1.scatter(positions[0, 0], positions[0, 1], c='green', s=100, marker='^', label='Start')
+        if len(positions) > 1:
+            ax1.scatter(positions[-1, 0], positions[-1, 1], c='red', s=100, marker='o', label='End')
+        ax1.set_xlabel('X (meters)')
+        ax1.set_ylabel('Y (meters)')
+        ax1.set_title('Top View (XY)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # XZ视图（侧视图）
+        if len(positions) > 1:
+            ax2.plot(positions[:, 0], positions[:, 2], 'g-', linewidth=2, alpha=0.7)
+        ax2.scatter(positions[:, 0], positions[:, 2], c=colors, s=50, alpha=0.8, edgecolors='black')
+        if len(positions) > 0:
+            ax2.scatter(positions[0, 0], positions[0, 2], c='green', s=100, marker='^')
+        if len(positions) > 1:
+            ax2.scatter(positions[-1, 0], positions[-1, 2], c='red', s=100, marker='o')
+        ax2.set_xlabel('X (meters)')
+        ax2.set_ylabel('Z (meters)')
+        ax2.set_title('Side View (XZ)')
+        ax2.grid(True, alpha=0.3)
+        
+        # YZ视图（正视图）
+        if len(positions) > 1:
+            ax3.plot(positions[:, 1], positions[:, 2], 'r-', linewidth=2, alpha=0.7)
+        ax3.scatter(positions[:, 1], positions[:, 2], c=colors, s=50, alpha=0.8, edgecolors='black')
+        if len(positions) > 0:
+            ax3.scatter(positions[0, 1], positions[0, 2], c='green', s=100, marker='^')
+        if len(positions) > 1:
+            ax3.scatter(positions[-1, 1], positions[-1, 2], c='red', s=100, marker='o')
+        ax3.set_xlabel('Y (meters)')
+        ax3.set_ylabel('Z (meters)')
+        ax3.set_title('Front View (YZ)')
+        ax3.grid(True, alpha=0.3)
+        
+        # 统计信息面板
+        ax4.axis('off')
+        stats_text = f"""VGGT Trajectory Statistics
+        
+Total Poses: {len(positions)}
+Position Range:
+  X: [{positions[:, 0].min():.3f}, {positions[:, 0].max():.3f}]
+  Y: [{positions[:, 1].min():.3f}, {positions[:, 1].max():.3f}]
+  Z: [{positions[:, 2].min():.3f}, {positions[:, 2].max():.3f}]
+
+Path Length: {np.sum(np.linalg.norm(np.diff(positions, axis=0), axis=1)):.3f}m"""
+        
+        ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes, fontsize=11,
+                verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+        
+        plt.tight_layout()
+        
+        # 保存为图像
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+            plt.savefig(tmp.name, dpi=120, bbox_inches='tight', facecolor='white')
+            plt.close()
+            
+            # 读取图像
+            img = cv2.imread(tmp.name)
+            os.unlink(tmp.name)
+            
+            if img is not None:
+                # BGR转RGB
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                # 转换为torch tensor
+                img_tensor = torch.from_numpy(img.astype(np.float32) / 255.0)
+                return img_tensor.unsqueeze(0)
+            else:
+                return _create_insufficient_data_image()
     
-    # 1. 顶视图 (Top View) - 左上角
-    top_view = _create_top_view(positions, orientations, size=(350, 250))
-    canvas[60:310, 20:370] = top_view
-    cv2.putText(canvas, "Top View (X-Z)", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0.2, 0.2, 0.2), 1)
-    
-    # 2. 侧视图 (Side View) - 右上角  
-    side_view = _create_side_view(positions, orientations, size=(350, 250))
-    canvas[60:310, 420:770] = side_view
-    cv2.putText(canvas, "Side View (X-Y)", (420, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0.2, 0.2, 0.2), 1)
-    
-    # 3. 伪3D视图 - 下方
-    pseudo_3d_view = _create_pseudo_3d_view(positions, orientations, size=(720, 250))
-    canvas[330:580, 40:760] = pseudo_3d_view
-    cv2.putText(canvas, "3D Perspective View", (40, 350), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0.2, 0.2, 0.2), 1)
-    
-    # 添加统计信息
-    _add_trajectory_stats(canvas, positions, orientations)
-    
-    return torch.from_numpy(canvas).unsqueeze(0)
+    except Exception as e:
+        print(f"VGGT: 创建备用2D可视化也失败: {e}")
+        return _create_insufficient_data_image()
 
 def _create_insufficient_data_image():
     """创建数据不足的提示图像"""
@@ -131,231 +300,9 @@ def _create_insufficient_data_image():
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0.5, 0.5, 0.5), 1)
     return torch.from_numpy(canvas).unsqueeze(0)
 
-def _create_top_view(positions, orientations, size=(350, 250)):
-    """创建顶视图 (X-Z平面)"""
-    canvas = np.ones((size[1], size[0], 3), dtype=np.float32) * 0.98
-    
-    # 计算投影范围
-    x, z = positions[:, 0], positions[:, 2]
-    x_range, z_range = _get_padded_range(x), _get_padded_range(z)
-    
-    # 绘制网格
-    _draw_grid(canvas, size, color=(0.9, 0.9, 0.9))
-    
-    # 转换坐标
-    pts_2d = _normalize_coords(np.column_stack([x, z]), x_range, z_range, size, margin=20)
-    
-    # 绘制轨迹线
-    _draw_trajectory_line(canvas, pts_2d, color=(0.2, 0.4, 0.8), thickness=2)
-    
-    # 绘制相机位置和朝向
-    for i, (pt, orient) in enumerate(zip(pts_2d, orientations)):
-        # 相机位置
-        color = _get_camera_color(i, len(pts_2d))
-        cv2.circle(canvas, tuple(pt.astype(int)), 4, color, -1)
-        
-        # 朝向指示器 (X-Z投影)
-        orient_2d = np.array([orient[0], orient[2]])  # X-Z投影
-        orient_2d = orient_2d / (np.linalg.norm(orient_2d) + 1e-8) * 15
-        end_pt = pt + orient_2d
-        cv2.arrowedLine(canvas, tuple(pt.astype(int)), tuple(end_pt.astype(int)), 
-                       color, 1, tipLength=0.3)
-        
-        # 帧编号
-        cv2.putText(canvas, str(i), (int(pt[0]+6), int(pt[1]+6)), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0,0,0), 1)
-    
-    return canvas
-
-def _create_side_view(positions, orientations, size=(350, 250)):
-    """创建侧视图 (X-Y平面)"""
-    canvas = np.ones((size[1], size[0], 3), dtype=np.float32) * 0.98
-    
-    # 计算投影范围
-    x, y = positions[:, 0], positions[:, 1]
-    x_range, y_range = _get_padded_range(x), _get_padded_range(y)
-    
-    # 绘制网格
-    _draw_grid(canvas, size, color=(0.9, 0.9, 0.9))
-    
-    # 转换坐标 (注意Y轴翻转)
-    pts_2d = _normalize_coords(np.column_stack([x, -y]), x_range, (-y_range[1], -y_range[0]), size, margin=20)
-    
-    # 绘制轨迹线
-    _draw_trajectory_line(canvas, pts_2d, color=(0.8, 0.4, 0.2), thickness=2)
-    
-    # 绘制相机位置
-    for i, pt in enumerate(pts_2d):
-        color = _get_camera_color(i, len(pts_2d))
-        cv2.circle(canvas, tuple(pt.astype(int)), 4, color, -1)
-        cv2.putText(canvas, str(i), (int(pt[0]+6), int(pt[1]+6)), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0,0,0), 1)
-    
-    return canvas
-
-def _create_pseudo_3d_view(positions, orientations, size=(720, 250)):
-    """创建伪3D视图"""
-    canvas = np.ones((size[1], size[0], 3), dtype=np.float32) * 0.98
-    
-    # 应用3D->2D投影变换 (等距投影)
-    # 旋转角度
-    angle_x, angle_y = np.pi/6, np.pi/4  # 30度和45度
-    
-    cos_x, sin_x = np.cos(angle_x), np.sin(angle_x)
-    cos_y, sin_y = np.cos(angle_y), np.sin(angle_y)
-    
-    # 3D到2D投影矩阵
-    proj_matrix = np.array([
-        [cos_y, sin_x*sin_y, 0],
-        [0, cos_x, sin_x]
-    ])
-    
-    # 投影3D点
-    pts_3d = positions.T  # (3, N)
-    pts_2d = proj_matrix @ pts_3d  # (2, N)
-    pts_2d = pts_2d.T  # (N, 2)
-    
-    # 归一化到画布
-    x_range = _get_padded_range(pts_2d[:, 0])
-    y_range = _get_padded_range(pts_2d[:, 1])
-    pts_canvas = _normalize_coords(pts_2d, x_range, y_range, size, margin=30)
-    
-    # 绘制3D网格效果
-    _draw_3d_grid(canvas, size)
-    
-    # 根据深度排序绘制
-    depths = positions[:, 2]  # Z坐标作为深度
-    depth_order = np.argsort(depths)
-    
-    # 绘制轨迹线（带深度渐变）
-    for i in range(len(depth_order)-1):
-        idx1, idx2 = depth_order[i], depth_order[i+1]
-        if abs(idx1 - idx2) == 1:  # 连续帧
-            pt1, pt2 = pts_canvas[idx1], pts_canvas[idx2]
-            # 深度渐变色
-            depth_ratio = (depths[idx1] - depths.min()) / (depths.max() - depths.min() + 1e-8)
-            color = (0.2 + 0.6*depth_ratio, 0.4, 0.8 - 0.4*depth_ratio)
-            cv2.line(canvas, tuple(pt1.astype(int)), tuple(pt2.astype(int)), color, 2)
-    
-    # 绘制相机（带深度大小变化）
-    for i in depth_order:
-        pt = pts_canvas[i]
-        depth_ratio = (depths[i] - depths.min()) / (depths.max() - depths.min() + 1e-8)
-        radius = int(3 + 4 * depth_ratio)  # 近大远小
-        color = _get_camera_color(i, len(positions))
-        
-        # 相机主体
-        cv2.circle(canvas, tuple(pt.astype(int)), radius, color, -1)
-        cv2.circle(canvas, tuple(pt.astype(int)), radius+1, (0,0,0), 1)
-        
-        # 朝向指示（3D投影）
-        orient_3d = orientations[i]
-        orient_2d = proj_matrix @ orient_3d
-        orient_2d = orient_2d / (np.linalg.norm(orient_2d) + 1e-8) * (10 + 5*depth_ratio)
-        end_pt = pt + orient_2d
-        cv2.arrowedLine(canvas, tuple(pt.astype(int)), tuple(end_pt.astype(int)), 
-                       color, max(1, int(depth_ratio*2+1)), tipLength=0.3)
-        
-        # 帧编号
-        cv2.putText(canvas, str(i), (int(pt[0]+8), int(pt[1]+8)), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,0,0), 1)
-    
-    return canvas
-
-def _get_padded_range(coords, padding=0.1):
-    """获取带边距的坐标范围"""
-    min_val, max_val = coords.min(), coords.max()
-    span = max_val - min_val
-    if span < 1e-8:
-        span = 1.0
-    margin = span * padding
-    return (min_val - margin, max_val + margin)
-
-def _normalize_coords(coords, x_range, y_range, size, margin=20):
-    """归一化坐标到画布"""
-    x_norm = (coords[:, 0] - x_range[0]) / (x_range[1] - x_range[0])
-    y_norm = (coords[:, 1] - y_range[0]) / (y_range[1] - y_range[0])
-    
-    canvas_coords = np.column_stack([
-        x_norm * (size[0] - 2*margin) + margin,
-        (1 - y_norm) * (size[1] - 2*margin) + margin  # 翻转Y轴
-    ])
-    return canvas_coords
-
-def _draw_grid(canvas, size, color=(0.9, 0.9, 0.9)):
-    """绘制网格"""
-    h, w = size[1], size[0]
-    # 垂直线
-    for x in range(0, w, w//8):
-        cv2.line(canvas, (x, 0), (x, h), color, 1)
-    # 水平线
-    for y in range(0, h, h//6):
-        cv2.line(canvas, (0, y), (w, y), color, 1)
-
-def _draw_3d_grid(canvas, size):
-    """绘制3D网格效果"""
-    h, w = size[1], size[0]
-    color = (0.85, 0.85, 0.85)
-    
-    # 斜向网格线
-    for i in range(0, w, w//12):
-        cv2.line(canvas, (i, 0), (i + h//3, h), color, 1)
-    for i in range(0, h, h//8):
-        cv2.line(canvas, (0, i), (w, i), color, 1)
-
-def _draw_trajectory_line(canvas, points, color, thickness=2):
-    """绘制轨迹线"""
-    for i in range(len(points)-1):
-        cv2.line(canvas, tuple(points[i].astype(int)), 
-                tuple(points[i+1].astype(int)), color, thickness)
-
-def _get_camera_color(index, total):
-    """获取相机颜色（彩虹渐变）"""
-    if total <= 1:
-        return (0.5, 0.5, 0.5)
-    
-    ratio = index / (total - 1)
-    if ratio < 0.2:
-        return (0.0, 0.8, 0.0)  # 绿色起点
-    elif ratio > 0.8:
-        return (0.8, 0.0, 0.0)  # 红色终点
-    else:
-        # 蓝色中间段
-        blue_intensity = 0.3 + 0.5 * np.sin(ratio * np.pi)
-        return (0.0, 0.2, blue_intensity)
-
-def _add_trajectory_stats(canvas, positions, orientations):
-    """添加轨迹统计信息"""
-    # 计算统计数据
-    total_distance = 0
-    for i in range(1, len(positions)):
-        total_distance += np.linalg.norm(positions[i] - positions[i-1])
-    
-    max_height = positions[:, 1].max()
-    min_height = positions[:, 1].min()
-    height_range = max_height - min_height
-    
-    # 显示统计信息
-    stats_x, stats_y = 40, 590
-    font_scale, thickness = 0.45, 1
-    color = (0.1, 0.1, 0.1)
-    
-    stats_text = [
-        f"Frames: {len(positions)}",
-        f"Distance: {total_distance:.2f}m",
-        f"Height Range: {height_range:.2f}m",
-        f"Avg Height: {positions[:, 1].mean():.2f}m"
-    ]
-    
-    for i, text in enumerate(stats_text):
-        cv2.putText(canvas, text, (stats_x + i*150, stats_y), 
-                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
-
 # -----------------------------------------------------------------------------
-# 节点实现
+# 主要节点实现
 # -----------------------------------------------------------------------------
-
-_VGGT_MODEL = None  # 全局缓存模型
 
 class VGGTVideoCameraNode:
     """VGGT 视频相机参数估计节点"""
@@ -364,6 +311,9 @@ class VGGTVideoCameraNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "vggt_model": ("VVL_VGGT_MODEL", {
+                    "tooltip": "来自VVLVGGTLoader的VGGT模型实例，包含已加载的模型和设备信息"
+                }),
                 "video": (IO.VIDEO, {
                     "tooltip": "来自 LoadVideo 的视频对象，或直接输入视频文件路径"
                 }),
@@ -371,16 +321,15 @@ class VGGTVideoCameraNode:
             "optional": {
                 "video_path": ("STRING", {
                     "default": "",
-                    "tooltip": "备用视频路径"
+                    "tooltip": "备用视频路径，当video输入为空时使用"
                 }),
                 "frame_interval": ("INT", {
-                    "default": 5, "min": 1, "max": 50, "step": 1
+                    "default": 5, "min": 1, "max": 50, "step": 1,
+                    "tooltip": "帧提取间隔，数值越小提取的帧越密集，但计算量更大"
                 }),
                 "max_frames": ("INT", {
-                    "default": 60, "min": 5, "max": 200, "step": 5
-                }),
-                "device": (["auto", "cuda", "cpu"], {
-                    "default": "auto"
+                    "default": 60, "min": 5, "max": 200, "step": 5,
+                    "tooltip": "最大提取帧数，用于控制计算量和内存使用"
                 }),
             }
         }
@@ -388,26 +337,11 @@ class VGGTVideoCameraNode:
     RETURN_TYPES = ("STRING", "IMAGE", "STRING")
     RETURN_NAMES = ("intrinsics_json", "trajectory_preview", "poses_json")
     FUNCTION = "estimate"
-    CATEGORY = "VGGT"
-
-    def __init__(self):
-        global _VGGT_MODEL
-        if VGGT is None:
-            print(f"[VGGT node] 导入 VGGT 失败: {_VGGT_IMPORT_ERROR}")
-            _VGGT_MODEL = None
-            return
-        if _VGGT_MODEL is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            try:
-                _VGGT_MODEL = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
-                _VGGT_MODEL.eval()
-                print("[VGGT node] VGGT 模型加载完成")
-            except Exception as e:
-                print(f"[VGGT node] 加载模型失败: {e}")
-                _VGGT_MODEL = None
+    CATEGORY = "💃VVL/VGGT"
 
     # ---------------------------------------------------------
     def _resolve_video_path(self, video: Any, fallback: str) -> str:
+        """解析视频路径"""
         if video is None:
             return fallback
         # 如果 video 是字符串
@@ -423,15 +357,23 @@ class VGGTVideoCameraNode:
         return fallback
 
     # ---------------------------------------------------------
-    def estimate(self, video=None, video_path: str = "", frame_interval: int = 5, max_frames: int = 60, device: str = "auto"):
+    def estimate(self, vggt_model: Dict, video=None, video_path: str = "", 
+                frame_interval: int = 5, max_frames: int = 60):
+        """执行相机参数估计"""
         try:
-            if _VGGT_MODEL is None:
-                raise RuntimeError("VGGT 模型未加载，无法推理")
-            if device == "auto":
-                device = "cuda" if torch.cuda.is_available() else "cpu"
+            # 检查VGGT工具函数是否可用
+            if not VGGT_UTILS_AVAILABLE:
+                raise RuntimeError(f"VGGT utils not available: {_VGGT_UTILS_IMPORT_ERROR}")
             
-            # 更兼容的dtype选择，避免BFloat16不支持问题
-            if device == "cuda":
+            # 从模型字典中获取信息
+            model_instance = vggt_model['model']
+            device = vggt_model['device']
+            model_name = vggt_model['model_name']
+            
+            logger.info(f"VGGTVideoCameraNode: Using {model_name} on {device}")
+            
+            # 确定数据类型
+            if device.type == "cuda":
                 try:
                     # 尝试使用BFloat16，如果不支持则fallback到Float16
                     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
@@ -445,9 +387,14 @@ class VGGTVideoCameraNode:
             if not vid_path or not os.path.exists(vid_path):
                 raise FileNotFoundError(f"找不到视频文件: {vid_path}")
 
+            logger.info(f"VGGTVideoCameraNode: Processing video: {vid_path}")
+
+            # 提取视频帧
             frames = _extract_video_frames(vid_path, frame_interval, max_frames)
             if not frames:
                 raise RuntimeError("无法从视频中提取帧")
+
+            logger.info(f"VGGTVideoCameraNode: Extracted {len(frames)} frames")
 
             # 将帧保存为 PNG 以复用官方预处理
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -459,31 +406,35 @@ class VGGTVideoCameraNode:
                     Image.fromarray(rgb).save(p)
                     img_paths.append(p)
 
+                # 加载并预处理图像
                 imgs = load_and_preprocess_images(img_paths).to(device)
-                print(f"[VGGT node] 加载图片数量: {len(img_paths)}, 处理后形状: {imgs.shape}")
+                logger.info(f"VGGTVideoCameraNode: Preprocessed images shape: {imgs.shape}")
 
+                # 模型推理
                 with torch.no_grad():
-                    # 使用与demo_gradio.py相同的调用方式：直接调用model()
                     try:
-                        with torch.amp.autocast(device_type="cuda", dtype=dtype):
-                            predictions = _VGGT_MODEL(imgs)  # 直接调用整个模型
+                        with torch.amp.autocast(device_type=device.type, dtype=dtype):
+                            predictions = model_instance(imgs)
                     except:
-                        # Fallback to old API
+                        # Fallback方案
                         try:
-                            with torch.cuda.amp.autocast(dtype=dtype):
-                                predictions = _VGGT_MODEL(imgs)  # 直接调用整个模型
+                            if device.type == "cuda":
+                                with torch.cuda.amp.autocast(dtype=dtype):
+                                    predictions = model_instance(imgs)
+                            else:
+                                predictions = model_instance(imgs)
                         except:
-                            # 如果autocast有问题，直接运行
-                            predictions = _VGGT_MODEL(imgs)  # 直接调用整个模型
+                            # 最后的fallback
+                            predictions = model_instance(imgs)
                     
                     # 从predictions中提取pose_enc
                     pose_enc = predictions["pose_enc"]
-                    print(f"[VGGT node] pose_enc形状: {pose_enc.shape}")
+                    logger.info(f"VGGTVideoCameraNode: pose_enc shape: {pose_enc.shape}")
                             
-                # extrinsic (1,N,3,4), intrinsic (1,N,3,3)
+                # 转换为内外参矩阵
                 extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, imgs.shape[-2:])
                 
-                # 如果有批次维度则去除
+                # 去除批次维度
                 if len(extrinsic.shape) == 4:  # (1,N,3,4)
                     extrinsic = extrinsic[0]   # (N,3,4)
                 if len(intrinsic.shape) == 4:  # (1,N,3,3)
@@ -491,22 +442,27 @@ class VGGTVideoCameraNode:
                     
                 extrinsic = extrinsic.cpu()
                 intrinsic = intrinsic.cpu()
-                print(f"[VGGT node] 最终矩阵形状 - extrinsic: {extrinsic.shape}, intrinsic: {intrinsic.shape}")
+                
+                logger.info(f"VGGTVideoCameraNode: Final matrix shapes - "
+                          f"extrinsic: {extrinsic.shape}, intrinsic: {intrinsic.shape}")
 
-            # JSON 输出
+            # 生成JSON输出
             intrinsics_json, poses_json = _matrices_to_json(intrinsic.numpy(), extrinsic.numpy())
 
-            # 轨迹图像
+            # 生成轨迹预览图
             traj_tensor = _create_traj_preview(extrinsic)
 
+            logger.info("VGGTVideoCameraNode: Camera estimation completed successfully")
             return (intrinsics_json, traj_tensor, poses_json)
 
         except Exception as e:
-            err = f"VGGT 估计错误: {e}"
-            print(err)
+            error_msg = f"VGGT估计错误: {str(e)}"
+            logger.error(error_msg)
+            
+            # 返回错误结果
             empty_img = torch.ones((1, 400, 400, 3), dtype=torch.float32) * 0.1
-            err_json = json.dumps({"success": False, "error": err}, ensure_ascii=False, indent=2)
-            return (err_json, empty_img, err_json)
+            error_json = json.dumps({"success": False, "error": error_msg}, ensure_ascii=False, indent=2)
+            return (error_json, empty_img, error_json)
 
 # -----------------------------------------------------------------------------
 # 节点注册
@@ -517,5 +473,10 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "VGGTVideoCameraNode": "VGGT Video Camera Estimator",
-} 
+    "VGGTVideoCameraNode": "VVL VGGT Video Camera Estimator",
+}
+
+# 如果模型加载器可用，添加到映射中
+if MODEL_LOADER_AVAILABLE:
+    NODE_CLASS_MAPPINGS["VVLVGGTLoader"] = VVLVGGTLoader
+    NODE_DISPLAY_NAME_MAPPINGS["VVLVGGTLoader"] = "VVL VGGT Model Loader" 
