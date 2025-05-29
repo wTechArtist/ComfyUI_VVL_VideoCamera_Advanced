@@ -148,16 +148,24 @@ def _create_traj_preview(extrinsic: torch.Tensor) -> torch.Tensor:
             position_range = positions.max(axis=0) - positions.min(axis=0)
             scene_scale = np.linalg.norm(position_range)
             
-            # 避免除零，设置最小场景尺度
+            # 更明显的箭头长度计算，确保箭头清晰可见
             if scene_scale < 1e-6:
-                direction_length = 0.5
+                direction_length = 0.5  # 极小场景使用更大的默认长度
             else:
-                direction_length = max(0.3, scene_scale * 0.08)
+                # 使用更明显的比例：8%~20%
+                direction_length = scene_scale * 0.15  # 基准 15%
+                min_len = scene_scale * 0.08  # 最小8%
+                max_len = scene_scale * 0.20   # 最大20%
+                direction_length = max(min_len, min(direction_length, max_len))
+                
+                # 进一步限制最大长度，避免箭头过长
+                absolute_max_length = scene_scale * 0.4  # 绝对不超过场景尺度的40%
+                direction_length = min(direction_length, absolute_max_length)
             
             # 绘制箭头，确保索引不越界
             arrow_count = 0
             for i in range(0, len(positions), step):
-                if i < len(orientations) and arrow_count < 15:  # 最多15个箭头
+                if i < len(orientations) and arrow_count < 12:  # 减少到最多12个箭头
                     pos = positions[i]
                     direction = orientations[i]
                     
@@ -167,9 +175,20 @@ def _create_traj_preview(extrinsic: torch.Tensor) -> torch.Tensor:
                         direction = direction / direction_norm
                         direction_scaled = direction * direction_length
                         
+                        # 检查箭头终点是否会超出场景边界
+                        arrow_end = pos + direction_scaled
+                        scene_min = positions.min(axis=0)
+                        scene_max = positions.max(axis=0)
+                        
+                        # 如果箭头会超出边界，进一步缩短
+                        for axis in range(3):
+                            if arrow_end[axis] < scene_min[axis] or arrow_end[axis] > scene_max[axis]:
+                                direction_scaled *= 0.7  # 缩短30%
+                                break
+                        
                         ax.quiver(pos[0], pos[1], pos[2], 
                                  direction_scaled[0], direction_scaled[1], direction_scaled[2], 
-                                 color='orange', alpha=0.7, arrow_length_ratio=0.15)
+                                 color='orange', alpha=0.8, arrow_length_ratio=0.2, linewidth=1.5)
                         arrow_count += 1
         
         # 设置坐标轴
