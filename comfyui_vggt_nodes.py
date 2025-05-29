@@ -102,8 +102,16 @@ def _create_traj_preview(extrinsic: torch.Tensor) -> torch.Tensor:
     positions = np.array(positions)
     orientations = np.array(orientations)
     
-    if positions.shape[0] < 2:
+    # 检查数据有效性
+    if len(positions) == 0:
+        print("VGGT: 没有有效的相机位姿数据")
         return _create_insufficient_data_image()
+    
+    print(f"VGGT: 处理 {len(positions)} 个相机位姿")
+    
+    # 即使只有一个位姿也可以显示
+    if len(positions) == 1:
+        print("VGGT: 单个相机位姿，将创建简化可视化")
 
     try:
         # 使用matplotlib创建3D立体可视化
@@ -132,18 +140,37 @@ def _create_traj_preview(extrinsic: torch.Tensor) -> torch.Tensor:
                       c='red', s=150, marker='o', label='End', edgecolors='darkred', linewidth=2)
         
         # 添加相机方向指示器（每几个位姿显示一个）
-        step = max(1, len(positions) // 10)
-        for i in range(0, len(positions), step):
-            pos = positions[i]
-            direction = orientations[i]
+        if len(positions) > 0 and len(orientations) > 0:
+            # 安全地计算显示步长，最多显示10个箭头
+            step = max(1, len(positions) // 10)
             
-            # 计算方向向量长度
-            direction_length = max(0.5, np.linalg.norm(positions.max(axis=0) - positions.min(axis=0)) * 0.1)
-            direction_scaled = direction * direction_length
+            # 计算合适的箭头长度
+            position_range = positions.max(axis=0) - positions.min(axis=0)
+            scene_scale = np.linalg.norm(position_range)
             
-            ax.quiver(pos[0], pos[1], pos[2], 
-                     direction_scaled[0], direction_scaled[1], direction_scaled[2], 
-                     color='orange', alpha=0.6, arrow_length_ratio=0.1)
+            # 避免除零，设置最小场景尺度
+            if scene_scale < 1e-6:
+                direction_length = 0.5
+            else:
+                direction_length = max(0.3, scene_scale * 0.08)
+            
+            # 绘制箭头，确保索引不越界
+            arrow_count = 0
+            for i in range(0, len(positions), step):
+                if i < len(orientations) and arrow_count < 15:  # 最多15个箭头
+                    pos = positions[i]
+                    direction = orientations[i]
+                    
+                    # 归一化方向向量，避免异常长度
+                    direction_norm = np.linalg.norm(direction)
+                    if direction_norm > 1e-6:
+                        direction = direction / direction_norm
+                        direction_scaled = direction * direction_length
+                        
+                        ax.quiver(pos[0], pos[1], pos[2], 
+                                 direction_scaled[0], direction_scaled[1], direction_scaled[2], 
+                                 color='orange', alpha=0.7, arrow_length_ratio=0.15)
+                        arrow_count += 1
         
         # 设置坐标轴
         ax.set_xlabel('X (meters)', fontsize=12)
@@ -159,10 +186,19 @@ def _create_traj_preview(extrinsic: torch.Tensor) -> torch.Tensor:
         cbar.set_label('Time Progress', fontsize=10)
         
         # 设置相等的坐标轴比例
-        max_range = np.array([positions.max(axis=0) - positions.min(axis=0)]).max() / 2.0
-        mid_x = (positions.max(axis=0)[0] + positions.min(axis=0)[0]) * 0.5
-        mid_y = (positions.max(axis=0)[1] + positions.min(axis=0)[1]) * 0.5
-        mid_z = (positions.max(axis=0)[2] + positions.min(axis=0)[2]) * 0.5
+        if len(positions) > 1:
+            max_range = np.array([positions.max(axis=0) - positions.min(axis=0)]).max() / 2.0
+            mid_x = (positions.max(axis=0)[0] + positions.min(axis=0)[0]) * 0.5
+            mid_y = (positions.max(axis=0)[1] + positions.min(axis=0)[1]) * 0.5
+            mid_z = (positions.max(axis=0)[2] + positions.min(axis=0)[2]) * 0.5
+        else:
+            # 单个位姿的情况，设置一个合理的显示范围
+            max_range = 2.0  # 默认2米的显示范围
+            mid_x, mid_y, mid_z = positions[0]
+        
+        # 确保范围不为零
+        if max_range < 0.1:
+            max_range = 1.0
         
         ax.set_xlim(mid_x - max_range, mid_x + max_range)
         ax.set_ylim(mid_y - max_range, mid_y + max_range)
