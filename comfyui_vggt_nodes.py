@@ -3,6 +3,7 @@ import json
 import tempfile
 from typing import List, Any, Dict
 import logging
+import struct
 
 import cv2
 import numpy as np
@@ -21,10 +22,12 @@ except ImportError:
 try:
     from vggt.utils.load_fn import load_and_preprocess_images
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+    from vggt.utils.geometry import unproject_depth_map_to_point_map
     VGGT_UTILS_AVAILABLE = True
 except Exception as e:
     load_and_preprocess_images = None
     pose_encoding_to_extri_intri = None
+    unproject_depth_map_to_point_map = None
     VGGT_UTILS_AVAILABLE = False
     _VGGT_UTILS_IMPORT_ERROR = e
 
@@ -36,29 +39,256 @@ except ImportError:
     VVLVGGTLoader = None
     MODEL_LOADER_AVAILABLE = False
 
+# 导入ComfyUI的路径管理
+try:
+    import folder_paths
+    FOLDER_PATHS_AVAILABLE = True
+except ImportError:
+    folder_paths = None
+    FOLDER_PATHS_AVAILABLE = False
+
+# 原版VGGT的dependencies
+try:
+    import trimesh
+    TRIMESH_AVAILABLE = True
+except ImportError:
+    TRIMESH_AVAILABLE = False
+    _TRIMESH_IMPORT_ERROR = "trimesh not available"
+
+try:
+    import matplotlib
+    import matplotlib.colormaps
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    _MATPLOTLIB_IMPORT_ERROR = "matplotlib not available"
+
+try:
+    from scipy.spatial.transform import Rotation
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    _SCIPY_IMPORT_ERROR = "scipy not available"
+
+try:
+    import copy
+    import requests
+    EXTRA_DEPS_AVAILABLE = True
+except ImportError:
+    EXTRA_DEPS_AVAILABLE = False
+
 # 配置日志
 logger = logging.getLogger('vvl_vggt_nodes')
+
+# -----------------------------------------------------------------------------
+# GLB文件生成函数（基于ComfyUI内置功能）
+# -----------------------------------------------------------------------------
+
+def save_glb(vertices, faces, filepath, colors=None, metadata=None):
+    """
+    将顶点和面保存为GLB文件（基于ComfyUI内置功能，增强版支持颜色）
+    
+    Parameters:
+    vertices: numpy.ndarray of shape (N, 3) - 顶点坐标
+    faces: numpy.ndarray of shape (M, 3) - 面索引（三角形面）
+    filepath: str - 输出文件路径（应该以.glb结尾）
+    colors: numpy.ndarray of shape (N, 3) - 顶点颜色（可选）
+    metadata: dict - 可选的元数据
+    """
+    
+    try:
+        logger.info(f"save_glb: 开始保存GLB文件到 {filepath}")
+        
+        # 确保输出目录存在
+        output_dir = os.path.dirname(filepath)
+        if not os.path.exists(output_dir):
+            logger.info(f"save_glb: 创建输出目录 {output_dir}")
+            os.makedirs(output_dir, exist_ok=True)
+        
+        # 确保是numpy数组
+        if isinstance(vertices, torch.Tensor):
+            vertices = vertices.cpu().numpy()
+        if isinstance(faces, torch.Tensor):
+            faces = faces.cpu().numpy()
+        if colors is not None and isinstance(colors, torch.Tensor):
+            colors = colors.cpu().numpy()
+        
+        vertices_np = vertices.astype(np.float32)
+        faces_np = faces.astype(np.uint32)
+        
+        logger.info(f"save_glb: 顶点形状 {vertices_np.shape}, 面形状 {faces_np.shape}")
+        if colors is not None:
+            colors_np = colors.astype(np.float32)
+            logger.info(f"save_glb: 颜色形状 {colors_np.shape}")
+    
+        vertices_buffer = vertices_np.tobytes()
+        indices_buffer = faces_np.tobytes()
+        
+        # 处理颜色数据
+        colors_buffer = b''
+        if colors is not None:
+            colors_buffer = colors_np.tobytes()
+
+        def pad_to_4_bytes(buffer):
+            padding_length = (4 - (len(buffer) % 4)) % 4
+            return buffer + b'\x00' * padding_length
+
+        vertices_buffer_padded = pad_to_4_bytes(vertices_buffer)
+        indices_buffer_padded = pad_to_4_bytes(indices_buffer)
+        colors_buffer_padded = pad_to_4_bytes(colors_buffer) if colors is not None else b''
+
+        buffer_data = vertices_buffer_padded + colors_buffer_padded + indices_buffer_padded
+
+        vertices_byte_length = len(vertices_buffer)
+        vertices_byte_offset = 0
+        colors_byte_length = len(colors_buffer)
+        colors_byte_offset = len(vertices_buffer_padded)
+        indices_byte_length = len(indices_buffer)
+        indices_byte_offset = len(vertices_buffer_padded) + len(colors_buffer_padded)
+
+        # 构建buffer views
+        buffer_views = [
+            {
+                "buffer": 0,
+                "byteOffset": vertices_byte_offset,
+                "byteLength": vertices_byte_length,
+                "target": 34962  # ARRAY_BUFFER
+            }
+        ]
+        
+        # 添加颜色buffer view
+        if colors is not None:
+            buffer_views.append({
+                "buffer": 0,
+                "byteOffset": colors_byte_offset,
+                "byteLength": colors_byte_length,
+                "target": 34962  # ARRAY_BUFFER
+            })
+        
+        # 添加索引buffer view
+        buffer_views.append({
+            "buffer": 0,
+            "byteOffset": indices_byte_offset,
+            "byteLength": indices_byte_length,
+            "target": 34963  # ELEMENT_ARRAY_BUFFER
+        })
+
+        # 构建accessors
+        accessors = [
+            {
+                "bufferView": 0,
+                "byteOffset": 0,
+                "componentType": 5126,  # FLOAT
+                "count": len(vertices_np),
+                "type": "VEC3",
+                "max": vertices_np.max(axis=0).tolist(),
+                "min": vertices_np.min(axis=0).tolist()
+            }
+        ]
+        
+        # 添加颜色accessor
+        if colors is not None:
+            accessors.append({
+                "bufferView": 1,
+                "byteOffset": 0,
+                "componentType": 5126,  # FLOAT
+                "count": len(colors_np),
+                "type": "VEC3",
+                "max": colors_np.max(axis=0).tolist(),
+                "min": colors_np.min(axis=0).tolist()
+            })
+        
+        # 添加索引accessor
+        indices_accessor_index = 2 if colors is not None else 1
+        accessors.append({
+            "bufferView": indices_accessor_index,
+            "byteOffset": 0,
+            "componentType": 5125,  # UNSIGNED_INT
+            "count": faces_np.size,
+            "type": "SCALAR"
+        })
+
+        # 构建mesh attributes
+        attributes = {"POSITION": 0}
+        if colors is not None:
+            attributes["COLOR_0"] = 1
+
+        gltf = {
+            "asset": {"version": "2.0", "generator": "ComfyUI-VGGT"},
+            "buffers": [
+                {
+                    "byteLength": len(buffer_data)
+                }
+            ],
+            "bufferViews": buffer_views,
+            "accessors": accessors,
+            "meshes": [
+                {
+                    "primitives": [
+                        {
+                            "attributes": attributes,
+                            "indices": indices_accessor_index,
+                            "mode": 4  # TRIANGLES
+                        }
+                    ]
+                }
+            ],
+            "nodes": [
+                {
+                    "mesh": 0
+                }
+            ],
+            "scenes": [
+                {
+                    "nodes": [0]
+                }
+            ],
+            "scene": 0
+        }
+
+        if metadata is not None:
+            gltf["asset"]["extras"] = metadata
+
+        # Convert the JSON to bytes
+        gltf_json = json.dumps(gltf).encode('utf8')
+
+        def pad_json_to_4_bytes(buffer):
+            padding_length = (4 - (len(buffer) % 4)) % 4
+            return buffer + b' ' * padding_length
+
+        gltf_json_padded = pad_json_to_4_bytes(gltf_json)
+
+        # Create the GLB header
+        # Magic glTF
+        glb_header = struct.pack('<4sII', b'glTF', 2, 12 + 8 + len(gltf_json_padded) + 8 + len(buffer_data))
+
+        # Create JSON chunk header (chunk type 0)
+        json_chunk_header = struct.pack('<II', len(gltf_json_padded), 0x4E4F534A)  # "JSON" in little endian
+
+        # Create BIN chunk header (chunk type 1)
+        bin_chunk_header = struct.pack('<II', len(buffer_data), 0x004E4942)  # "BIN\0" in little endian
+
+        # Write the GLB file
+        logger.info(f"save_glb: 开始写入GLB文件")
+        with open(filepath, 'wb') as f:
+            f.write(glb_header)
+            f.write(json_chunk_header)
+            f.write(gltf_json_padded)
+            f.write(bin_chunk_header)
+            f.write(buffer_data)
+
+        logger.info(f"save_glb: GLB文件写入完成")
+        return filepath
+    
+    except Exception as e:
+        logger.error(f"save_glb: 初始化失败 {e}")
+        raise e
 
 # -----------------------------------------------------------------------------
 # 工具函数
 # -----------------------------------------------------------------------------
 
-def _extract_video_frames(video_path: str, interval: int, max_frames: int) -> List[np.ndarray]:
-    """按照给定间隔提取视频帧 (BGR)."""
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-    idx = 0
-    while len(frames) < max_frames:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if idx % interval == 0:
-            frames.append(frame.copy())
-        idx += 1
-    cap.release()
-    return frames
-
-def _matrices_to_json(intrinsic, extrinsic) -> (str, str):
+def _matrices_to_json(intrinsic, extrinsic, source_type="video") -> (str, str):
     """将相机矩阵转换为 JSON 字符串。"""
     num_views = extrinsic.shape[0]
     intrinsics_list = []
@@ -71,17 +301,87 @@ def _matrices_to_json(intrinsic, extrinsic) -> (str, str):
         t = np.array(Rt)[:3, 3]
         position = (-R.T @ t).tolist()
         intrinsics_list.append({
-            "view_id": i,
+            "view_id": i,  # view_id对应输入序列中的索引
             "intrinsic_matrix": K
         })
         poses_list.append({
-            "view_id": i,
+            "view_id": i,  # view_id对应输入序列中的索引
             "extrinsic_matrix": Rt,
             "position": position
         })
+    
+    # 根据源类型生成不同的元数据说明
+    if source_type == "images":
+        description = "view_id对应输入图片序列中的索引"
+        note = "view_id=0对应第一张输入图片，view_id=1对应第二张输入图片，以此类推"
+    else:  # video
+        description = "view_id对应提取的帧序号，不是原视频的帧索引"
+        note = "原版Gradio模式：固定每秒1帧提取，无帧数限制，处理整个视频"
+    
+    # 相机内参矩阵格式说明
+    intrinsic_format_info = {
+        "matrix_format": "3x3相机内参矩阵，OpenCV标准格式",
+        "matrix_structure": [
+            ["fx",  "0",  "cx"],
+            ["0",   "fy", "cy"],
+            ["0",   "0",  "1"]
+        ],
+        "parameters": {
+            "fx": "X轴焦距（像素单位）- 图像宽度方向的焦距",
+            "fy": "Y轴焦距（像素单位）- 图像高度方向的焦距",
+            "cx": "主点X坐标（像素单位）- 光轴与图像平面交点的X坐标",
+            "cy": "主点Y坐标（像素单位）- 光轴与图像平面交点的Y坐标"
+        },
+        "coordinate_system": "OpenCV图像坐标系：原点在左上角，X轴向右，Y轴向下",
+        "units": "所有参数单位为像素(pixels)"
+    }
+    
+    # 相机外参矩阵格式说明
+    extrinsic_format_info = {
+        "matrix_format": "3x4相机外参矩阵 [R|t]，世界坐标系到相机坐标系的变换",
+        "matrix_structure": [
+            ["r11", "r12", "r13", "tx"],
+            ["r21", "r22", "r23", "ty"],
+            ["r31", "r32", "r33", "tz"]
+        ],
+        "components": {
+            "R": "3x3旋转矩阵 - 世界坐标系到相机坐标系的旋转变换",
+            "t": "3x1平移向量 - 相机在世界坐标系中的位置（经过旋转变换）"
+        },
+        "coordinate_system": {
+            "world_frame": "世界坐标系：Z轴向上，X轴向前，Y轴向左（右手坐标系）",
+            "camera_frame": "相机坐标系：Z轴向前（光轴方向），X轴向右，Y轴向下"
+        },
+        "position_calculation": "相机在世界坐标系中的实际位置 = -R^T * t",
+        "units": "平移向量单位为米(meters)，旋转矩阵无量纲"
+    }
+    
+    # 添加元数据说明
+    intrinsics_data = {
+        "cameras": intrinsics_list,
+        "metadata": {
+            "source_type": source_type,
+            "description": description,
+            "note": note,
+            "total_views": num_views,
+            "format_specification": intrinsic_format_info
+        }
+    }
+    
+    poses_data = {
+        "poses": poses_list,
+        "metadata": {
+            "source_type": source_type,
+            "description": description,
+            "note": note,
+            "total_views": num_views,
+            "format_specification": extrinsic_format_info
+        }
+    }
+    
     return (
-        json.dumps({"cameras": intrinsics_list}, ensure_ascii=False, indent=2),
-        json.dumps({"poses": poses_list}, ensure_ascii=False, indent=2),
+        json.dumps(intrinsics_data, ensure_ascii=False, indent=2),
+        json.dumps(poses_data, ensure_ascii=False, indent=2),
     )
 
 def _create_traj_preview(extrinsic: torch.Tensor) -> torch.Tensor:
@@ -355,12 +655,286 @@ def _create_insufficient_data_image():
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0.5, 0.5, 0.5), 1)
     return torch.from_numpy(canvas).unsqueeze(0)
 
+def _run_vggt_model_inference(image_paths: List[str], model_instance, device) -> Dict:
+    """
+    运行VGGT模型推理，参考Gradio代码中的run_model函数
+    """
+    try:
+        # 加载并预处理图像
+        images = load_and_preprocess_images(image_paths).to(device)
+        logger.info(f"预处理图像形状: {images.shape}")
+        
+        # 确定数据类型
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        
+        # 模型推理
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(dtype=dtype):
+                predictions = model_instance(images)
+        
+        # 转换pose encoding为外参和内参矩阵
+        logger.info("转换pose encoding为外参和内参矩阵...")
+        extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
+        predictions["extrinsic"] = extrinsic
+        predictions["intrinsic"] = intrinsic
+        
+        # 转换tensors为numpy
+        for key in predictions.keys():
+            if isinstance(predictions[key], torch.Tensor):
+                predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # 移除batch维度
+        
+        # 从深度图生成世界坐标点
+        logger.info("从深度图计算世界坐标点...")
+        depth_map = predictions["depth"]  # (S, H, W, 1)
+        world_points = unproject_depth_map_to_point_map(depth_map, predictions["extrinsic"], predictions["intrinsic"])
+        predictions["world_points_from_depth"] = world_points
+        
+        # 清理GPU内存
+        torch.cuda.empty_cache()
+        return predictions
+        
+    except Exception as e:
+        logger.error(f"VGGT模型推理失败: {e}")
+        raise e
+
+def _generate_3d_model_from_predictions(predictions: Dict, filename_prefix: str = "3d/vggt_model", 
+                                      conf_thres: float = 50.0, 
+                                      show_cam: bool = True,
+                                      mask_black_bg: bool = False,
+                                      mask_white_bg: bool = False,
+                                      mask_sky: bool = False) -> tuple:
+    """
+    根据VGGT预测结果生成3D模型文件（GLB格式）
+    使用原版predictions_to_glb函数确保原汁原味的输出质量，不降低精度
+    
+    Returns:
+        tuple: (glb_path, ui_result) - 文件路径和UI结果字典
+    """
+    try:
+        # 检查依赖
+        if not TRIMESH_AVAILABLE:
+            logger.error(f"trimesh不可用: {_TRIMESH_IMPORT_ERROR}")
+            return _generate_3d_model_fallback(predictions, filename_prefix, conf_thres, show_cam, mask_black_bg, mask_white_bg, mask_sky)
+        
+        if not MATPLOTLIB_AVAILABLE:
+            logger.error(f"matplotlib不可用: {_MATPLOTLIB_IMPORT_ERROR}")
+            return _generate_3d_model_fallback(predictions, filename_prefix, conf_thres, show_cam, mask_black_bg, mask_white_bg, mask_sky)
+        
+        if not SCIPY_AVAILABLE:
+            logger.error(f"scipy不可用: {_SCIPY_IMPORT_ERROR}")
+            return _generate_3d_model_fallback(predictions, filename_prefix, conf_thres, show_cam, mask_black_bg, mask_white_bg, mask_sky)
+        
+        # 使用ComfyUI标准路径处理方式
+        if FOLDER_PATHS_AVAILABLE:
+            full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+                filename_prefix, folder_paths.get_output_directory()
+            )
+        else:
+            # 备用方案
+            full_output_folder = os.path.join("output", "3d")
+            os.makedirs(full_output_folder, exist_ok=True)
+            filename = "vggt_model"
+            counter = 0
+            subfolder = "3d"
+        
+        # 生成文件名（包含参数信息但更简洁）
+        param_suffix = f"_conf{conf_thres:.0f}"
+        if show_cam:
+            param_suffix += "_cam"
+        if mask_black_bg:
+            param_suffix += "_mbg"
+        if mask_white_bg:
+            param_suffix += "_mwg"
+        if mask_sky:
+            param_suffix += "_msky"
+            
+        glb_filename = f"{filename}_{counter:05}{param_suffix}.glb"
+        glb_path = os.path.join(full_output_folder, glb_filename)
+        
+        logger.info(f"使用原版predictions_to_glb生成3D模型（原汁原味，不降低精度）: {glb_path}")
+        
+        # 调用原版predictions_to_glb函数 - 使用原汁原味的参数
+        scene_3d = predictions_to_glb(
+            predictions,
+            conf_thres=conf_thres,
+            filter_by_frames="all",  # 处理所有帧
+            mask_black_bg=mask_black_bg,
+            mask_white_bg=mask_white_bg,
+            show_cam=show_cam,
+            mask_sky=mask_sky,
+            target_dir=None,  # 不需要中间文件目录，因为我们在ComfyUI环境中
+            prediction_mode="Predicted Pointmap"  # 优先使用Pointmap分支
+        )
+        
+        # 保存trimesh.Scene为GLB文件 - 原滋原味，不降低精度
+        logger.info(f"保存原版trimesh.Scene到GLB文件: {glb_path}")
+        scene_3d.export(glb_path)
+        
+        # 验证文件是否真的被创建
+        if os.path.exists(glb_path):
+            file_size = os.path.getsize(glb_path)
+            logger.info(f"成功生成原版质量3D模型: {glb_path}, 文件大小: {file_size} bytes")
+            
+            # 返回ComfyUI标准格式的结果
+            ui_result = {
+                "filename": glb_filename,
+                "subfolder": subfolder,
+                "type": "output"
+            }
+            
+            return glb_path, ui_result
+        else:
+            logger.error(f"GLB文件保存失败，文件不存在: {glb_path}")
+            return "", {}
+            
+    except Exception as e:
+        logger.error(f"使用原版predictions_to_glb生成3D模型失败: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # 如果原版方法失败，尝试备用方法
+        logger.info("尝试使用备用GLB生成方法...")
+        return _generate_3d_model_fallback(predictions, filename_prefix, conf_thres, show_cam, mask_black_bg, mask_white_bg, mask_sky)
+
+def _generate_3d_model_fallback(predictions: Dict, filename_prefix: str = "3d/vggt_model", 
+                              conf_thres: float = 50.0, 
+                              show_cam: bool = True,
+                              mask_black_bg: bool = False,
+                              mask_white_bg: bool = False,
+                              mask_sky: bool = False) -> tuple:
+    """
+    备用3D模型生成方法（当原版方法失败时使用）
+    保持原汁原味的数据，不降低精度
+    """
+    try:
+        # 使用ComfyUI标准路径处理方式
+        if FOLDER_PATHS_AVAILABLE:
+            full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+                filename_prefix, folder_paths.get_output_directory()
+            )
+        else:
+            # 备用方案
+            full_output_folder = os.path.join("output", "3d")
+            os.makedirs(full_output_folder, exist_ok=True)
+            filename = "vggt_model"
+            counter = 0
+            subfolder = "3d"
+        
+        # 生成文件名
+        param_suffix = f"_fallback_conf{conf_thres}"
+        glb_filename = f"{filename}_{counter:05}_{param_suffix}.glb"
+        glb_path = os.path.join(full_output_folder, glb_filename)
+        
+        # 获取数据
+        if "world_points_from_depth" in predictions:
+            world_points = predictions["world_points_from_depth"]  # (S, H, W, 3)
+        else:
+            logger.warning("world_points_from_depth not found, skipping 3D model generation")
+            return "", {}
+        
+        # 获取图像颜色信息
+        images = predictions.get("images", None)
+        
+        # 简单的点云处理 - 不降低精度，保持原汁原味
+        S, H, W = world_points.shape[:3]
+        
+        # 按照原版逻辑处理
+        vertices_3d = world_points.reshape(-1, 3)
+        
+        # 处理颜色
+        if images is not None:
+            # 处理图像格式
+            if images.ndim == 4 and images.shape[1] == 3:  # NCHW format
+                colors_rgb = np.transpose(images, (0, 2, 3, 1))
+            else:  # Assume already in NHWC format
+                colors_rgb = images
+            colors_rgb = (colors_rgb.reshape(-1, 3) * 255).astype(np.uint8)
+        else:
+            # 没有颜色信息，生成默认颜色
+            colors_rgb = np.ones((len(vertices_3d), 3), dtype=np.uint8) * 128
+        
+        # 简单的置信度过滤（按照原版逻辑）
+        if conf_thres > 0:
+            # 使用距离作为置信度的简单替代
+            center = np.mean(vertices_3d, axis=0)
+            distances = np.linalg.norm(vertices_3d - center, axis=1)
+            threshold = np.percentile(distances, conf_thres)
+            conf_mask = distances <= threshold
+        else:
+            conf_mask = np.ones(len(vertices_3d), dtype=bool)
+        
+        # 应用背景过滤
+        if mask_black_bg:
+            black_bg_mask = colors_rgb.sum(axis=1) >= 16
+            conf_mask = conf_mask & black_bg_mask
+        
+        if mask_white_bg:
+            white_bg_mask = ~((colors_rgb[:, 0] > 240) & (colors_rgb[:, 1] > 240) & (colors_rgb[:, 2] > 240))
+            conf_mask = conf_mask & white_bg_mask
+        
+        # 应用过滤
+        vertices_3d = vertices_3d[conf_mask]
+        colors_rgb = colors_rgb[conf_mask]
+        
+        if len(vertices_3d) == 0:
+            vertices_3d = np.array([[1, 0, 0]])
+            colors_rgb = np.array([[255, 255, 255]])
+        
+        # 生成简单的面（每3个点组成一个三角形）
+        n_points = len(vertices_3d)
+        n_triangles = max(1, n_points // 3)
+        faces = []
+        for i in range(n_triangles):
+            if i*3+2 < n_points:
+                faces.append([i*3, i*3+1, i*3+2])
+        
+        if not faces:
+            faces = [[0, 0, 0]]  # 至少一个面
+        
+        faces = np.array(faces, dtype=np.uint32)
+        
+        logger.info(f"备用方法生成了 {len(vertices_3d)} 个顶点和 {len(faces)} 个面（保持原始精度）")
+        
+        # 生成元数据
+        metadata = {
+            "source": "VGGT-Fallback",
+            "confidence_threshold": conf_thres,
+            "show_cameras": show_cam,
+            "num_vertices": len(vertices_3d),
+            "num_faces": len(faces),
+            "method": "fallback_original_quality"
+        }
+        
+        # 使用简化的GLB保存方法
+        save_glb_simple(vertices_3d, faces, glb_path, metadata)
+        
+        # 验证文件是否真的被创建
+        if os.path.exists(glb_path):
+            file_size = os.path.getsize(glb_path)
+            logger.info(f"备用方法成功生成3D模型: {glb_path}, 文件大小: {file_size} bytes")
+            
+            # 返回ComfyUI标准格式的结果
+            ui_result = {
+                "filename": glb_filename,
+                "subfolder": subfolder,
+                "type": "output"
+            }
+            
+            return glb_path, ui_result
+        else:
+            logger.error(f"备用方法GLB文件保存失败")
+            return "", {}
+            
+    except Exception as e:
+        logger.error(f"备用3D模型生成方法也失败: {e}")
+        return "", {}
+
 # -----------------------------------------------------------------------------
 # 主要节点实现
 # -----------------------------------------------------------------------------
 
-class VGGTVideoCameraNode:
-    """VGGT 视频相机参数估计节点"""
+class VGGTMultiInputNode:
+    """VGGT 多输入相机参数估计节点 - 支持视频和图片序列输入"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -369,36 +943,53 @@ class VGGTVideoCameraNode:
                 "vggt_model": ("VVL_VGGT_MODEL", {
                     "tooltip": "来自VVLVGGTLoader的VGGT模型实例，包含已加载的模型和设备信息"
                 }),
-                "video": (IO.VIDEO, {
-                    "tooltip": "来自 LoadVideo 的视频对象，或直接输入视频文件路径"
-                }),
             },
             "optional": {
-                "video_path": ("STRING", {
-                    "default": "",
-                    "tooltip": "备用视频路径，当video输入为空时使用"
+                "video": (IO.VIDEO, {
+                    "tooltip": "视频输入（可选）"
                 }),
-                "frame_interval": ("INT", {
-                    "default": 5, "min": 1, "max": 50, "step": 1,
-                    "tooltip": "帧提取间隔，数值越小提取的帧越密集，但计算量更大"
+                "images": ("IMAGE", {
+                    "tooltip": "图片序列输入（可选）"
                 }),
-                "max_frames": ("INT", {
-                    "default": 60, "min": 5, "max": 200, "step": 5,
-                    "tooltip": "最大提取帧数，用于控制计算量和内存使用"
+                "confidence_threshold": ("FLOAT", {
+                    "default": 50.0, "min": 0.0, "max": 100.0, "step": 0.1,
+                    "tooltip": "置信度阈值(%)，用于过滤3D点云中的低置信度点"
+                }),
+                "show_cameras": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "是否在3D模型中显示相机位置"
+                }),
+                "mask_black_bg": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "是否过滤黑色背景点"
+                }),
+                "mask_white_bg": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "是否过滤白色背景点"
+                }),
+                "mask_sky": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "是否过滤天空点"
                 }),
             }
         }
 
-    RETURN_TYPES = ("STRING", "IMAGE", "STRING")
-    RETURN_NAMES = ("intrinsics_json", "trajectory_preview", "poses_json")
-    FUNCTION = "estimate"
+    RETURN_TYPES = ("STRING", "IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("intrinsics_json", "trajectory_preview", "poses_json", "model_3d_path")
+    OUTPUT_TOOLTIPS = [
+        "相机内参数据 (JSON格式)",
+        "相机轨迹2D预览图像",
+        "相机位姿数据 (JSON格式)",
+        "3D模型文件路径 (可连接到Preview3D或其他节点)"
+    ]
+    OUTPUT_NODE = True
+    FUNCTION = "estimate_multi_input"
     CATEGORY = "💃VVL/VGGT"
 
-    # ---------------------------------------------------------
-    def _resolve_video_path(self, video: Any, fallback: str) -> str:
+    def _resolve_video_path(self, video: Any) -> str:
         """解析视频路径"""
         if video is None:
-            return fallback
+            return ""
         # 如果 video 是字符串
         if isinstance(video, str):
             return video
@@ -409,12 +1000,36 @@ class VGGTVideoCameraNode:
                 val = getattr(video, attr)
                 if isinstance(val, str):
                     return val
-        return fallback
+        return ""
 
-    # ---------------------------------------------------------
-    def estimate(self, vggt_model: Dict, video=None, video_path: str = "", 
-                frame_interval: int = 5, max_frames: int = 60):
-        """执行相机参数估计"""
+    def _extract_video_frames_original(self, video_path: str) -> List[np.ndarray]:
+        """按照原版Gradio方式提取视频帧：固定每秒1帧，无帧数限制"""
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_interval = int(fps * 1)  # 每秒1帧，与原版Gradio一致
+        
+        frames = []
+        count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            count += 1
+            if count % frame_interval == 0:
+                frames.append(frame.copy())
+        
+        cap.release()
+        logger.info(f"VGGTMultiInputNode: 按原版方式提取了 {len(frames)} 帧 (每秒1帧)")
+        return frames
+
+    def estimate_multi_input(self, vggt_model: Dict, 
+                           video=None, images=None,
+                           confidence_threshold: float = 50.0,
+                           show_cameras: bool = True,
+                           mask_black_bg: bool = False,
+                           mask_white_bg: bool = False,
+                           mask_sky: bool = False):
+        """多输入方式的相机参数估计"""
         try:
             # 检查VGGT工具函数是否可用
             if not VGGT_UTILS_AVAILABLE:
@@ -425,110 +1040,712 @@ class VGGTVideoCameraNode:
             device = vggt_model['device']
             model_name = vggt_model['model_name']
             
-            logger.info(f"VGGTVideoCameraNode: Using {model_name} on {device}")
+            logger.info(f"VGGTMultiInputNode: Using {model_name} on {device}")
             
-            # 确定数据类型
-            if device.type == "cuda":
-                try:
-                    # 尝试使用BFloat16，如果不支持则fallback到Float16
-                    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-                except:
-                    dtype = torch.float16
+            # 确定输入源和处理方式
+            img_paths = []
+            
+            # 处理图片序列输入
+            if images is not None and images.shape[0] > 0:
+                logger.info(f"VGGTMultiInputNode: 处理图片序列输入，数量: {images.shape[0]}")
+                
+                # 保存图片到临时文件
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    for i in range(images.shape[0]):
+                        img_tensor = images[i]
+                        
+                        # 确保数值范围正确
+                        if img_tensor.max() <= 1.0:
+                            img_np = (img_tensor.cpu().numpy() * 255).astype(np.uint8)
+                        else:
+                            img_np = img_tensor.cpu().numpy().astype(np.uint8)
+                        
+                        img_path = os.path.join(tmpdir, f"image_{i:04d}.png")
+                        Image.fromarray(img_np).save(img_path)
+                        img_paths.append(img_path)
+                    
+                    # 运行推理
+                    predictions = _run_vggt_model_inference(img_paths, model_instance, device)
+            
+            # 处理视频输入
+            elif video is not None:
+                vid_path = self._resolve_video_path(video)
+                if not vid_path or not os.path.exists(vid_path):
+                    raise FileNotFoundError(f"找不到视频文件: {vid_path}")
+                
+                logger.info(f"VGGTMultiInputNode: 处理视频输入: {vid_path}")
+                
+                # 使用原版Gradio方式提取视频帧
+                frames = self._extract_video_frames_original(vid_path)
+                if not frames:
+                    raise RuntimeError("无法从视频中提取帧")
+                
+                # 保存帧到临时文件
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    for i, frame in enumerate(frames):
+                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        img_path = os.path.join(tmpdir, f"frame_{i:04d}.png")
+                        Image.fromarray(rgb).save(img_path)
+                        img_paths.append(img_path)
+                    
+                    # 运行推理
+                    predictions = _run_vggt_model_inference(img_paths, model_instance, device)
+            
             else:
-                dtype = torch.float32
-
-            # 解析视频路径
-            vid_path = self._resolve_video_path(video, video_path)
-            if not vid_path or not os.path.exists(vid_path):
-                raise FileNotFoundError(f"找不到视频文件: {vid_path}")
-
-            logger.info(f"VGGTVideoCameraNode: Processing video: {vid_path}")
-
-            # 提取视频帧
-            frames = _extract_video_frames(vid_path, frame_interval, max_frames)
-            if not frames:
-                raise RuntimeError("无法从视频中提取帧")
-
-            logger.info(f"VGGTVideoCameraNode: Extracted {len(frames)} frames")
-
-            # 将帧保存为 PNG 以复用官方预处理
-            with tempfile.TemporaryDirectory() as tmpdir:
-                img_paths = []
-                for i, frm in enumerate(frames):
-                    rgb = cv2.cvtColor(frm, cv2.COLOR_BGR2RGB)
-                    p = os.path.join(tmpdir, f"frame_{i:04d}.png")
-                    # 使用PIL保存RGB图片，避免cv2的BGR问题
-                    Image.fromarray(rgb).save(p)
-                    img_paths.append(p)
-
-                # 加载并预处理图像
-                imgs = load_and_preprocess_images(img_paths).to(device)
-                logger.info(f"VGGTVideoCameraNode: Preprocessed images shape: {imgs.shape}")
-
-                # 模型推理
-                with torch.no_grad():
-                    try:
-                        with torch.amp.autocast(device_type=device.type, dtype=dtype):
-                            predictions = model_instance(imgs)
-                    except:
-                        # Fallback方案
-                        try:
-                            if device.type == "cuda":
-                                with torch.cuda.amp.autocast(dtype=dtype):
-                                    predictions = model_instance(imgs)
-                            else:
-                                predictions = model_instance(imgs)
-                        except:
-                            # 最后的fallback
-                            predictions = model_instance(imgs)
-                    
-                    # 从predictions中提取pose_enc
-                    pose_enc = predictions["pose_enc"]
-                    logger.info(f"VGGTVideoCameraNode: pose_enc shape: {pose_enc.shape}")
-                            
-                # 转换为内外参矩阵
-                extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, imgs.shape[-2:])
-                
-                # 去除批次维度
-                if len(extrinsic.shape) == 4:  # (1,N,3,4)
-                    extrinsic = extrinsic[0]   # (N,3,4)
-                if len(intrinsic.shape) == 4:  # (1,N,3,3)
-                    intrinsic = intrinsic[0]   # (N,3,3)
-                    
-                extrinsic = extrinsic.cpu()
-                intrinsic = intrinsic.cpu()
-                
-                logger.info(f"VGGTVideoCameraNode: Final matrix shapes - "
-                          f"extrinsic: {extrinsic.shape}, intrinsic: {intrinsic.shape}")
+                raise ValueError("必须提供视频或图片序列输入")
+            
+            # 生成3D模型文件
+            model_3d_path, ui_result = _generate_3d_model_from_predictions(
+                predictions, filename_prefix="3d/vggt_model",
+                conf_thres=confidence_threshold,
+                show_cam=show_cameras,
+                mask_black_bg=mask_black_bg,
+                mask_white_bg=mask_white_bg,
+                mask_sky=mask_sky
+            )
 
             # 生成JSON输出
-            intrinsics_json, poses_json = _matrices_to_json(intrinsic.numpy(), extrinsic.numpy())
+            source_type = "images" if images is not None else "video"
+            intrinsics_json, poses_json = _matrices_to_json(predictions["intrinsic"], predictions["extrinsic"], source_type)
 
             # 生成轨迹预览图
-            traj_tensor = _create_traj_preview(extrinsic)
+            extrinsic_tensor = torch.from_numpy(predictions["extrinsic"]).float()
+            traj_tensor = _create_traj_preview(extrinsic_tensor)
 
-            logger.info("VGGTVideoCameraNode: Camera estimation completed successfully")
-            return (intrinsics_json, traj_tensor, poses_json)
+            logger.info("VGGTMultiInputNode: Camera estimation completed successfully")
+            
+            # 准备返回的3D模型路径
+            if model_3d_path and os.path.exists(model_3d_path):
+                # 使用ComfyUI的带注释路径格式
+                if FOLDER_PATHS_AVAILABLE:
+                    try:
+                        # 使用folder_paths.get_annotated_filepath来生成正确的路径格式
+                        annotated_path = folder_paths.get_annotated_filepath(model_3d_path)
+                        model_output_path = annotated_path
+                    except:
+                        # 备用方案：手动生成相对路径
+                        relative_path = os.path.relpath(model_3d_path, folder_paths.get_output_directory())
+                        model_output_path = f"{relative_path} [output]"
+                else:
+                    model_output_path = model_3d_path
+            else:
+                model_output_path = ""
+            
+            # 返回结果，包括UI结果用于3D模型预览和直接的文件路径
+            result = (intrinsics_json, traj_tensor, poses_json, model_output_path)
+            if ui_result:
+                return {"ui": {"3d": [ui_result]}, "result": result}
+            else:
+                return {"result": result}
 
         except Exception as e:
-            error_msg = f"VGGT估计错误: {str(e)}"
+            error_msg = f"VGGT多输入估计错误: {str(e)}"
             logger.error(error_msg)
             
             # 返回错误结果
             empty_img = torch.ones((1, 400, 400, 3), dtype=torch.float32) * 0.1
             error_json = json.dumps({"success": False, "error": error_msg}, ensure_ascii=False, indent=2)
-            return (error_json, empty_img, error_json)
+            return {"result": (error_json, empty_img, error_json, "")}
+
+# -----------------------------------------------------------------------------
+# 原版VGGT的predictions_to_glb函数和所有辅助函数（完整移植自visual_util.py）
+# -----------------------------------------------------------------------------
+
+def predictions_to_glb(
+    predictions,
+    conf_thres=50.0,
+    filter_by_frames="all",
+    mask_black_bg=False,
+    mask_white_bg=False,
+    show_cam=True,
+    mask_sky=False,
+    target_dir=None,
+    prediction_mode="Predicted Pointmap",
+) -> "trimesh.Scene":
+    """
+    Converts VGGT predictions to a 3D scene represented as a GLB file.
+
+    Args:
+        predictions (dict): Dictionary containing model predictions with keys:
+            - world_points: 3D point coordinates (S, H, W, 3)
+            - world_points_conf: Confidence scores (S, H, W)
+            - images: Input images (S, H, W, 3)
+            - extrinsic: Camera extrinsic matrices (S, 3, 4)
+        conf_thres (float): Percentage of low-confidence points to filter out (default: 50.0)
+        filter_by_frames (str): Frame filter specification (default: "all")
+        mask_black_bg (bool): Mask out black background pixels (default: False)
+        mask_white_bg (bool): Mask out white background pixels (default: False)
+        show_cam (bool): Include camera visualization (default: True)
+        mask_sky (bool): Apply sky segmentation mask (default: False)
+        target_dir (str): Output directory for intermediate files (default: None)
+        prediction_mode (str): Prediction mode selector (default: "Predicted Pointmap")
+
+    Returns:
+        trimesh.Scene: Processed 3D scene containing point cloud and cameras
+
+    Raises:
+        ValueError: If input predictions structure is invalid
+    """
+    if not isinstance(predictions, dict):
+        raise ValueError("predictions must be a dictionary")
+
+    if conf_thres is None:
+        conf_thres = 10.0
+
+    print("Building GLB scene")
+    selected_frame_idx = None
+    if filter_by_frames != "all" and filter_by_frames != "All":
+        try:
+            # Extract the index part before the colon
+            selected_frame_idx = int(filter_by_frames.split(":")[0])
+        except (ValueError, IndexError):
+            pass
+
+    if "Pointmap" in prediction_mode:
+        print("Using Pointmap Branch")
+        if "world_points" in predictions:
+            pred_world_points = predictions["world_points"]  # No batch dimension to remove
+            pred_world_points_conf = predictions.get("world_points_conf", np.ones_like(pred_world_points[..., 0]))
+        else:
+            print("Warning: world_points not found in predictions, falling back to depth-based points")
+            pred_world_points = predictions["world_points_from_depth"]
+            pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
+    else:
+        print("Using Depthmap and Camera Branch")
+        pred_world_points = predictions["world_points_from_depth"]
+        pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
+
+    # Get images from predictions
+    images = predictions["images"]
+    # Use extrinsic matrices instead of pred_extrinsic_list
+    camera_matrices = predictions["extrinsic"]
+
+    if mask_sky:
+        if target_dir is not None:
+            import onnxruntime
+
+            skyseg_session = None
+            target_dir_images = target_dir + "/images"
+            image_list = sorted(os.listdir(target_dir_images))
+            sky_mask_list = []
+
+            # Get the shape of pred_world_points_conf to match
+            S, H, W = (
+                pred_world_points_conf.shape
+                if hasattr(pred_world_points_conf, "shape")
+                else (len(images), images.shape[1], images.shape[2])
+            )
+
+            # Download skyseg.onnx if it doesn't exist
+            if not os.path.exists("skyseg.onnx"):
+                print("Downloading skyseg.onnx...")
+                download_file_from_url(
+                    "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx", "skyseg.onnx"
+                )
+
+            for i, image_name in enumerate(image_list):
+                image_filepath = os.path.join(target_dir_images, image_name)
+                mask_filepath = os.path.join(target_dir, "sky_masks", image_name)
+
+                # Check if mask already exists
+                if os.path.exists(mask_filepath):
+                    # Load existing mask
+                    sky_mask = cv2.imread(mask_filepath, cv2.IMREAD_GRAYSCALE)
+                else:
+                    # Generate new mask
+                    if skyseg_session is None:
+                        skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
+                    sky_mask = segment_sky(image_filepath, skyseg_session, mask_filepath)
+
+                # Resize mask to match H×W if needed
+                if sky_mask.shape[0] != H or sky_mask.shape[1] != W:
+                    sky_mask = cv2.resize(sky_mask, (W, H))
+
+                sky_mask_list.append(sky_mask)
+
+            # Convert list to numpy array with shape S×H×W
+            sky_mask_array = np.array(sky_mask_list)
+
+            # Apply sky mask to confidence scores
+            sky_mask_binary = (sky_mask_array > 0.1).astype(np.float32)
+            pred_world_points_conf = pred_world_points_conf * sky_mask_binary
+
+    if selected_frame_idx is not None:
+        pred_world_points = pred_world_points[selected_frame_idx][None]
+        pred_world_points_conf = pred_world_points_conf[selected_frame_idx][None]
+        images = images[selected_frame_idx][None]
+        camera_matrices = camera_matrices[selected_frame_idx][None]
+
+    vertices_3d = pred_world_points.reshape(-1, 3)
+    # Handle different image formats - check if images need transposing
+    if images.ndim == 4 and images.shape[1] == 3:  # NCHW format
+        colors_rgb = np.transpose(images, (0, 2, 3, 1))
+    else:  # Assume already in NHWC format
+        colors_rgb = images
+    colors_rgb = (colors_rgb.reshape(-1, 3) * 255).astype(np.uint8)
+
+    conf = pred_world_points_conf.reshape(-1)
+    # Convert percentage threshold to actual confidence value
+    if conf_thres == 0.0:
+        conf_threshold = 0.0
+    else:
+        conf_threshold = np.percentile(conf, conf_thres)
+
+    conf_mask = (conf >= conf_threshold) & (conf > 1e-5)
+
+    if mask_black_bg:
+        black_bg_mask = colors_rgb.sum(axis=1) >= 16
+        conf_mask = conf_mask & black_bg_mask
+
+    if mask_white_bg:
+        # Filter out white background pixels (RGB values close to white)
+        # Consider pixels white if all RGB values are above 240
+        white_bg_mask = ~((colors_rgb[:, 0] > 240) & (colors_rgb[:, 1] > 240) & (colors_rgb[:, 2] > 240))
+        conf_mask = conf_mask & white_bg_mask
+
+    vertices_3d = vertices_3d[conf_mask]
+    colors_rgb = colors_rgb[conf_mask]
+
+    if vertices_3d is None or np.asarray(vertices_3d).size == 0:
+        vertices_3d = np.array([[1, 0, 0]])
+        colors_rgb = np.array([[255, 255, 255]])
+        scene_scale = 1
+    else:
+        # Calculate the 5th and 95th percentiles along each axis
+        lower_percentile = np.percentile(vertices_3d, 5, axis=0)
+        upper_percentile = np.percentile(vertices_3d, 95, axis=0)
+
+        # Calculate the diagonal length of the percentile bounding box
+        scene_scale = np.linalg.norm(upper_percentile - lower_percentile)
+
+    colormap = matplotlib.colormaps.get_cmap("gist_rainbow")
+
+    # Initialize a 3D scene
+    scene_3d = trimesh.Scene()
+
+    # Add point cloud data to the scene
+    point_cloud_data = trimesh.PointCloud(vertices=vertices_3d, colors=colors_rgb)
+
+    scene_3d.add_geometry(point_cloud_data)
+
+    # Prepare 4x4 matrices for camera extrinsics
+    num_cameras = len(camera_matrices)
+    extrinsics_matrices = np.zeros((num_cameras, 4, 4))
+    extrinsics_matrices[:, :3, :4] = camera_matrices
+    extrinsics_matrices[:, 3, 3] = 1
+
+    if show_cam:
+        # Add camera models to the scene
+        for i in range(num_cameras):
+            world_to_camera = extrinsics_matrices[i]
+            camera_to_world = np.linalg.inv(world_to_camera)
+            rgba_color = colormap(i / num_cameras)
+            current_color = tuple(int(255 * x) for x in rgba_color[:3])
+
+            integrate_camera_into_scene(scene_3d, camera_to_world, current_color, scene_scale)
+
+    # Align scene to the observation of the first camera
+    scene_3d = apply_scene_alignment(scene_3d, extrinsics_matrices)
+
+    print("GLB Scene built")
+    return scene_3d
+
+
+def integrate_camera_into_scene(scene: "trimesh.Scene", transform: np.ndarray, face_colors: tuple, scene_scale: float):
+    """
+    Integrates a fake camera mesh into the 3D scene.
+
+    Args:
+        scene (trimesh.Scene): The 3D scene to add the camera model.
+        transform (np.ndarray): Transformation matrix for camera positioning.
+        face_colors (tuple): Color of the camera face.
+        scene_scale (float): Scale of the scene.
+    """
+
+    cam_width = scene_scale * 0.05
+    cam_height = scene_scale * 0.1
+
+    # Create cone shape for camera
+    rot_45_degree = np.eye(4)
+    rot_45_degree[:3, :3] = Rotation.from_euler("z", 45, degrees=True).as_matrix()
+    rot_45_degree[2, 3] = -cam_height
+
+    opengl_transform = get_opengl_conversion_matrix()
+    # Combine transformations
+    complete_transform = transform @ opengl_transform @ rot_45_degree
+    camera_cone_shape = trimesh.creation.cone(cam_width, cam_height, sections=4)
+
+    # Generate mesh for the camera
+    slight_rotation = np.eye(4)
+    slight_rotation[:3, :3] = Rotation.from_euler("z", 2, degrees=True).as_matrix()
+
+    vertices_combined = np.concatenate(
+        [
+            camera_cone_shape.vertices,
+            0.95 * camera_cone_shape.vertices,
+            transform_points(slight_rotation, camera_cone_shape.vertices),
+        ]
+    )
+    vertices_transformed = transform_points(complete_transform, vertices_combined)
+
+    mesh_faces = compute_camera_faces(camera_cone_shape)
+
+    # Add the camera mesh to the scene
+    camera_mesh = trimesh.Trimesh(vertices=vertices_transformed, faces=mesh_faces)
+    camera_mesh.visual.face_colors[:, :3] = face_colors
+    scene.add_geometry(camera_mesh)
+
+
+def apply_scene_alignment(scene_3d: "trimesh.Scene", extrinsics_matrices: np.ndarray) -> "trimesh.Scene":
+    """
+    Aligns the 3D scene based on the extrinsics of the first camera.
+
+    Args:
+        scene_3d (trimesh.Scene): The 3D scene to be aligned.
+        extrinsics_matrices (np.ndarray): Camera extrinsic matrices.
+
+    Returns:
+        trimesh.Scene: Aligned 3D scene.
+    """
+    # Set transformations for scene alignment
+    opengl_conversion_matrix = get_opengl_conversion_matrix()
+
+    # Rotation matrix for alignment (180 degrees around the y-axis)
+    align_rotation = np.eye(4)
+    align_rotation[:3, :3] = Rotation.from_euler("y", 180, degrees=True).as_matrix()
+
+    # Apply transformation
+    initial_transformation = np.linalg.inv(extrinsics_matrices[0]) @ opengl_conversion_matrix @ align_rotation
+    scene_3d.apply_transform(initial_transformation)
+    return scene_3d
+
+
+def get_opengl_conversion_matrix() -> np.ndarray:
+    """
+    Constructs and returns the OpenGL conversion matrix.
+
+    Returns:
+        numpy.ndarray: A 4x4 OpenGL conversion matrix.
+    """
+    # Create an identity matrix
+    matrix = np.identity(4)
+
+    # Flip the y and z axes
+    matrix[1, 1] = -1
+    matrix[2, 2] = -1
+
+    return matrix
+
+
+def transform_points(transformation: np.ndarray, points: np.ndarray, dim: int = None) -> np.ndarray:
+    """
+    Applies a 4x4 transformation to a set of points.
+
+    Args:
+        transformation (np.ndarray): Transformation matrix.
+        points (np.ndarray): Points to be transformed.
+        dim (int, optional): Dimension for reshaping the result.
+
+    Returns:
+        np.ndarray: Transformed points.
+    """
+    points = np.asarray(points)
+    initial_shape = points.shape[:-1]
+    dim = dim or points.shape[-1]
+
+    # Apply transformation
+    transformation = transformation.swapaxes(-1, -2)  # Transpose the transformation matrix
+    points = points @ transformation[..., :-1, :] + transformation[..., -1:, :]
+
+    # Reshape the result
+    result = points[..., :dim].reshape(*initial_shape, dim)
+    return result
+
+
+def compute_camera_faces(cone_shape: "trimesh.Trimesh") -> np.ndarray:
+    """
+    Computes the faces for the camera mesh.
+
+    Args:
+        cone_shape (trimesh.Trimesh): The shape of the camera cone.
+
+    Returns:
+        np.ndarray: Array of faces for the camera mesh.
+    """
+    # Create pseudo cameras
+    faces_list = []
+    num_vertices_cone = len(cone_shape.vertices)
+
+    for face in cone_shape.faces:
+        if 0 in face:
+            continue
+        v1, v2, v3 = face
+        v1_offset, v2_offset, v3_offset = face + num_vertices_cone
+        v1_offset_2, v2_offset_2, v3_offset_2 = face + 2 * num_vertices_cone
+
+        faces_list.extend(
+            [
+                (v1, v2, v2_offset),
+                (v1, v1_offset, v3),
+                (v3_offset, v2, v3),
+                (v1, v2, v2_offset_2),
+                (v1, v1_offset_2, v3),
+                (v3_offset_2, v2, v3),
+            ]
+        )
+
+    faces_list += [(v3, v2, v1) for v1, v2, v3 in faces_list]
+    return np.array(faces_list)
+
+
+def segment_sky(image_path, onnx_session, mask_filename=None):
+    """
+    Segments sky from an image using an ONNX model.
+    Thanks for the great model provided by https://github.com/xiongzhu666/Sky-Segmentation-and-Post-processing
+
+    Args:
+        image_path: Path to input image
+        onnx_session: ONNX runtime session with loaded model
+        mask_filename: Path to save the output mask
+
+    Returns:
+        np.ndarray: Binary mask where 255 indicates non-sky regions
+    """
+
+    assert mask_filename is not None
+    image = cv2.imread(image_path)
+
+    result_map = run_skyseg(onnx_session, [320, 320], image)
+    # resize the result_map to the original image size
+    result_map_original = cv2.resize(result_map, (image.shape[1], image.shape[0]))
+
+    # Fix: Invert the mask so that 255 = non-sky, 0 = sky
+    # The model outputs low values for sky, high values for non-sky
+    output_mask = np.zeros_like(result_map_original)
+    output_mask[result_map_original < 32] = 255  # Use threshold of 32
+
+    os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
+    cv2.imwrite(mask_filename, output_mask)
+    return output_mask
+
+
+def run_skyseg(onnx_session, input_size, image):
+    """
+    Runs sky segmentation inference using ONNX model.
+
+    Args:
+        onnx_session: ONNX runtime session
+        input_size: Target size for model input (width, height)
+        image: Input image in BGR format
+
+    Returns:
+        np.ndarray: Segmentation mask
+    """
+
+    # Pre process:Resize, BGR->RGB, Transpose, PyTorch standardization, float32 cast
+    temp_image = copy.deepcopy(image)
+    resize_image = cv2.resize(temp_image, dsize=(input_size[0], input_size[1]))
+    x = cv2.cvtColor(resize_image, cv2.COLOR_BGR2RGB)
+    x = np.array(x, dtype=np.float32)
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+    x = (x / 255 - mean) / std
+    x = x.transpose(2, 0, 1)
+    x = x.reshape(-1, 3, input_size[0], input_size[1]).astype("float32")
+
+    # Inference
+    input_name = onnx_session.get_inputs()[0].name
+    output_name = onnx_session.get_outputs()[0].name
+    onnx_result = onnx_session.run([output_name], {input_name: x})
+
+    # Post process
+    onnx_result = np.array(onnx_result).squeeze()
+    min_value = np.min(onnx_result)
+    max_value = np.max(onnx_result)
+    onnx_result = (onnx_result - min_value) / (max_value - min_value)
+    onnx_result *= 255
+    onnx_result = onnx_result.astype("uint8")
+
+    return onnx_result
+
+
+def download_file_from_url(url, filename):
+    """Downloads a file from a Hugging Face model repo, handling redirects."""
+    try:
+        # Get the redirect URL
+        response = requests.get(url, allow_redirects=False)
+        response.raise_for_status()  # Raise HTTPError for bad requests (4xx or 5xx)
+
+        if response.status_code == 302:  # Expecting a redirect
+            redirect_url = response.headers["Location"]
+            response = requests.get(redirect_url, stream=True)
+            response.raise_for_status()
+        else:
+            print(f"Unexpected status code: {response.status_code}")
+            return
+
+        with open(filename, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print(f"Downloaded {filename} successfully.")
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading file: {e}")
+
+# -----------------------------------------------------------------------------
+# 简化的GLB生成函数（仅作为备用）
+# -----------------------------------------------------------------------------
+
+def save_glb_simple(vertices, faces, filepath, metadata=None):
+    """
+    简化的GLB保存函数（备用）
+    """
+    try:
+        logger.info(f"save_glb_simple: 开始保存GLB文件到 {filepath}")
+        
+        # 确保输出目录存在
+        output_dir = os.path.dirname(filepath)
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+        
+        # 确保是numpy数组
+        if isinstance(vertices, torch.Tensor):
+            vertices = vertices.cpu().numpy()
+        if isinstance(faces, torch.Tensor):
+            faces = faces.cpu().numpy()
+        
+        vertices_np = vertices.astype(np.float32)
+        faces_np = faces.astype(np.uint32)
+    
+        vertices_buffer = vertices_np.tobytes()
+        indices_buffer = faces_np.tobytes()
+
+        def pad_to_4_bytes(buffer):
+            padding_length = (4 - (len(buffer) % 4)) % 4
+            return buffer + b'\x00' * padding_length
+
+        vertices_buffer_padded = pad_to_4_bytes(vertices_buffer)
+        indices_buffer_padded = pad_to_4_bytes(indices_buffer)
+
+        buffer_data = vertices_buffer_padded + indices_buffer_padded
+
+        vertices_byte_length = len(vertices_buffer)
+        vertices_byte_offset = 0
+        indices_byte_length = len(indices_buffer)
+        indices_byte_offset = len(vertices_buffer_padded)
+
+        gltf = {
+            "asset": {"version": "2.0", "generator": "ComfyUI-VGGT"},
+            "buffers": [
+                {
+                    "byteLength": len(buffer_data)
+                }
+            ],
+            "bufferViews": [
+                {
+                    "buffer": 0,
+                    "byteOffset": vertices_byte_offset,
+                    "byteLength": vertices_byte_length,
+                    "target": 34962  # ARRAY_BUFFER
+                },
+                {
+                    "buffer": 0,
+                    "byteOffset": indices_byte_offset,
+                    "byteLength": indices_byte_length,
+                    "target": 34963  # ELEMENT_ARRAY_BUFFER
+                }
+            ],
+            "accessors": [
+                {
+                    "bufferView": 0,
+                    "byteOffset": 0,
+                    "componentType": 5126,  # FLOAT
+                    "count": len(vertices_np),
+                    "type": "VEC3",
+                    "max": vertices_np.max(axis=0).tolist(),
+                    "min": vertices_np.min(axis=0).tolist()
+                },
+                {
+                    "bufferView": 1,
+                    "byteOffset": 0,
+                    "componentType": 5125,  # UNSIGNED_INT
+                    "count": faces_np.size,
+                    "type": "SCALAR"
+                }
+            ],
+            "meshes": [
+                {
+                    "primitives": [
+                        {
+                            "attributes": {
+                                "POSITION": 0
+                            },
+                            "indices": 1,
+                            "mode": 4  # TRIANGLES
+                        }
+                    ]
+                }
+            ],
+            "nodes": [
+                {
+                    "mesh": 0
+                }
+            ],
+            "scenes": [
+                {
+                    "nodes": [0]
+                }
+            ],
+            "scene": 0
+        }
+
+        if metadata is not None:
+            gltf["asset"]["extras"] = metadata
+
+        # Convert the JSON to bytes
+        gltf_json = json.dumps(gltf).encode('utf8')
+
+        def pad_json_to_4_bytes(buffer):
+            padding_length = (4 - (len(buffer) % 4)) % 4
+            return buffer + b' ' * padding_length
+
+        gltf_json_padded = pad_json_to_4_bytes(gltf_json)
+
+        # Create the GLB header
+        # Magic glTF
+        glb_header = struct.pack('<4sII', b'glTF', 2, 12 + 8 + len(gltf_json_padded) + 8 + len(buffer_data))
+
+        # Create JSON chunk header (chunk type 0)
+        json_chunk_header = struct.pack('<II', len(gltf_json_padded), 0x4E4F534A)  # "JSON" in little endian
+
+        # Create BIN chunk header (chunk type 1)
+        bin_chunk_header = struct.pack('<II', len(buffer_data), 0x004E4942)  # "BIN\0" in little endian
+
+        # Write the GLB file
+        with open(filepath, 'wb') as f:
+            f.write(glb_header)
+            f.write(json_chunk_header)
+            f.write(gltf_json_padded)
+            f.write(bin_chunk_header)
+            f.write(buffer_data)
+
+        logger.info(f"save_glb_simple: GLB文件写入完成")
+        return filepath
+    
+    except Exception as e:
+        logger.error(f"save_glb_simple: 保存失败 {e}")
+        raise e
 
 # -----------------------------------------------------------------------------
 # 节点注册
 # -----------------------------------------------------------------------------
 
 NODE_CLASS_MAPPINGS = {
-    "VGGTVideoCameraNode": VGGTVideoCameraNode,
+    "VGGTMultiInputNode": VGGTMultiInputNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "VGGTVideoCameraNode": "VVL VGGT Video Camera Estimator",
+    "VGGTMultiInputNode": "VVL VGGT Multi Input Camera Estimator",
 }
 
 # 如果模型加载器可用，添加到映射中
