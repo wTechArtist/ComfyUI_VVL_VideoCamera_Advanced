@@ -1,0 +1,16 @@
+[project]
+name = "vvl_videocamera_advanced"
+description = "A professional video camera parameter estimation toolkit based on the VGGT model."
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = ["torch==2.3.1", "torchvision==0.18.1", "numpy==1.26.1", "Pillow", "huggingface_hub", "einops", "safetensors", "pydantic==2.10.6"]
+
+[project.urls]
+Repository = "https://github.com/wTechArtist/ComfyUI_VVL_VideoCamera_Advanced"
+#  Used by Comfy Registry https://registry.comfy.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI_VVL_VideoCamera_Advanced"
+Icon = ""
+includes = []
