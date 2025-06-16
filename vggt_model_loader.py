@@ -7,6 +7,7 @@ import os
 import logging
 from typing import Dict, Optional
 import torch
+from huggingface_hub import hf_hub_download
 
 # ComfyUI相关导入
 try:
@@ -20,6 +21,12 @@ except ImportError:
 
 # VGGT相关导入
 try:
+    # 确保可以找到vggt模块
+    import sys
+    current_dir = os.path.dirname(__file__)
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    
     from vggt.models.vggt import VGGT
     VGGT_AVAILABLE = True
 except Exception as e:
@@ -104,17 +111,31 @@ def load_vggt_model(model_name: str, device: torch.device) -> Optional[torch.nn.
         config = VGGT_MODEL_CONFIG[model_name]
         local_path = get_vggt_model_path(config)
         
-        # 加载模型
+        # ----------------------------
+        # 1) 若本地已有权重，则直接加载
+        # 2) 若无，则从 HuggingFace Hub 下载到同目录，再加载
+        # ----------------------------
         if local_path and os.path.exists(local_path):
             logger.info(f"Loading VGGT model from local path: {local_path}")
-            # 注意：这里可能需要根据实际的本地加载API调整
-            # 目前先使用HuggingFace的方式，后续可以优化为直接加载本地权重
-            model = VGGT.from_pretrained(config["model_name"])
         else:
-            # 从HuggingFace加载（会自动下载）
-            logger.info(f"Loading VGGT model from HuggingFace: {config['model_name']}")
-            logger.warning(f"Model will be downloaded (~{config.get('size_mb', 'Unknown')}MB)")
-            model = VGGT.from_pretrained(config["model_name"])
+            logger.info(f"Local weight not found, downloading from HuggingFace Hub: {config['model_name']}")
+            try:
+                local_path = hf_hub_download(
+                    repo_id=config["model_name"],
+                    filename="model.pt",
+                    local_dir=get_vggt_model_dir(),
+                    cache_dir=get_vggt_model_dir(),
+                    resume_download=True,
+                )
+                logger.info(f"Model downloaded to: {local_path}")
+            except Exception as e:
+                logger.error(f"Failed to download VGGT model: {e}")
+                raise
+
+        # 统一使用本地权重文件加载
+        model = VGGT()
+        state_dict = torch.load(local_path, map_location="cpu")
+        model.load_state_dict(state_dict)
         
         # 移动到指定设备并设置为评估模式
         model = model.to(device)

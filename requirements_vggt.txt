@@ -1,0 +1,25 @@
+# VGGT专用依赖 - 核心依赖优先
+# 基础依赖
+packaging>=20.0
+trimesh>=3.15.0
+scipy>=1.9.0
+matplotlib>=3.5.0
+onnxruntime>=1.15.0
+omegaconf>=2.3.0
+open3d>=0.17.0
+pydantic<3  # VGGT 依赖 v1/v2 过渡接口
+tqdm<=4.66.4  # 版本锁定，避免兼容性问题
+
+# 额外工具依赖
+requests>=2.25.0
+Pillow>=8.0.0
+opencv-python>=4.5.0
+
+# 可选依赖（注释掉，避免安装问题）
+# flash-attn>=2.4.2  # 推荐，支持Flash Attention 3，但可能有编译问题
+# gsplat>=1.3.0  # 可选，用于Gaussian Splatting集成
+# gradio>=4.0.0  # 仅demo需要
+# viser>=0.1.0  # 仅demo需要
+# hydra-core>=1.3.0  # 可选
+# ttach>=0.0.4  # 可选
+# pytorch3d>=0.7.6  # 可选，但可能有编译问题 

@@ -18,8 +18,24 @@ except ImportError:
         VIDEO = "VIDEO"
         IMAGE = "IMAGE"
 
+# 导入原生VGGT接口
+try:
+    from .vggt_native_interface import VGGTNativeInterface, VGGTImageProcessor, VGGTResultProcessor
+    VGGT_NATIVE_AVAILABLE = True
+except ImportError:
+    VGGTNativeInterface = None
+    VGGTImageProcessor = None
+    VGGTResultProcessor = None
+    VGGT_NATIVE_AVAILABLE = False
+
 # 导入 VGGT 相关函数
 try:
+    # 确保可以找到vggt模块
+    import sys
+    current_dir = os.path.dirname(__file__)
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    
     from vggt.utils.load_fn import load_and_preprocess_images
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
     from vggt.utils.geometry import unproject_depth_map_to_point_map
@@ -79,6 +95,135 @@ except ImportError:
 
 # 配置日志
 logger = logging.getLogger('vvl_vggt_nodes')
+
+# -----------------------------------------------------------------------------
+# 原生VGGT推理函数
+# -----------------------------------------------------------------------------
+
+def run_vggt_native_inference(images: torch.Tensor, model_instance, device) -> Dict:
+    """使用原生VGGT接口进行推理"""
+    if not VGGT_NATIVE_AVAILABLE:
+        raise ImportError("VGGT Native Interface not available")
+    
+    try:
+        # 创建原生接口
+        vggt_interface = VGGTNativeInterface(model_instance, device)
+        
+        # 执行完整推理流程
+        results = vggt_interface.full_inference_pipeline(images)
+        
+        logger.info(f"VGGT native inference completed. Results keys: {list(results.keys())}")
+        return results
+        
+    except Exception as e:
+        logger.error(f"VGGT native inference failed: {e}")
+        raise
+
+def preprocess_images_native(images_list: List[np.ndarray]) -> torch.Tensor:
+    """使用原生VGGT预处理器处理图像"""
+    if not VGGT_NATIVE_AVAILABLE:
+        raise ImportError("VGGT Native Interface not available")
+    
+    try:
+        return VGGTImageProcessor.preprocess_images(images_list)
+    except Exception as e:
+        logger.error(f"Native image preprocessing failed: {e}")
+        raise
+
+def format_results_native(results: Dict) -> Dict:
+    """简化的结果格式化器，直接基于VGGT标准输出"""
+    try:
+        formatted_results = {}
+        
+        # 相机参数格式化
+        if 'cameras' in results:
+            extrinsic = results['cameras']['extrinsic']
+            intrinsic = results['cameras']['intrinsic']
+            
+            # 确保是numpy格式用于JSON序列化
+            if hasattr(extrinsic, 'cpu'):
+                extrinsic_np = extrinsic.cpu().numpy()
+            else:
+                extrinsic_np = extrinsic
+            
+            if hasattr(intrinsic, 'cpu'):
+                intrinsic_np = intrinsic.cpu().numpy()
+            else:
+                intrinsic_np = intrinsic
+            
+            formatted_results['cameras'] = {
+                "raw": {
+                    "extrinsic": extrinsic,
+                    "intrinsic": intrinsic,
+                },
+                "json": {
+                    "extrinsic_matrices": extrinsic_np.tolist(),
+                    "intrinsic_matrices": intrinsic_np.tolist(),
+                    "format": "opencv_convention",
+                }
+            }
+        
+        # 深度结果格式化
+        if 'depth' in results and 'depth_conf' in results:
+            depth_map = results['depth']
+            confidence = results['depth_conf']
+            
+            formatted_results['depth'] = {
+                "raw": {
+                    "depth_map": depth_map,
+                    "confidence": confidence,
+                },
+                "json": {
+                    "has_depth": True,
+                    "has_confidence": True,
+                }
+            }
+        
+        # 点云格式化
+        if 'world_points' in results:
+            points = results['world_points']
+            
+            formatted_results['points'] = {
+                "raw": {
+                    "point_map": points,
+                    "confidence": results.get('world_points_conf', None),
+                },
+                "json": {
+                    "has_points": True,
+                    "point_format": "world_coordinates",
+                }
+            }
+        
+        # 深度点云格式化
+        if 'points_from_depth' in results:
+            formatted_results['points_from_depth'] = {
+                "raw": {
+                    "points": results['points_from_depth'],
+                },
+                "json": {
+                    "has_points": True,
+                    "point_format": "unprojected_from_depth",
+                }
+            }
+        
+        # 跟踪结果格式化
+        if 'track' in results:
+            formatted_results['tracks'] = {
+                "raw": {
+                    "track_list": results['track'],
+                    "visibility_score": results.get('vis', None),
+                    "confidence_score": results.get('conf', None),
+                },
+                "json": {
+                    "has_tracks": True,
+                }
+            }
+        
+        return formatted_results
+        
+    except Exception as e:
+        logger.error(f"Native result formatting failed: {e}")
+        return {"error": str(e)}
 
 # -----------------------------------------------------------------------------
 # GLB文件生成函数（基于ComfyUI内置功能）
@@ -934,7 +1079,7 @@ def _generate_3d_model_fallback(predictions: Dict, filename_prefix: str = "3d/vg
 # -----------------------------------------------------------------------------
 
 class VGGTMultiInputNode:
-    """VGGT 多输入相机参数估计节点 - 支持视频和图片序列输入"""
+    """VGGT 多输入重建节点 - 支持图片序列输入，实现原生VGGT算法"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -943,14 +1088,11 @@ class VGGTMultiInputNode:
                 "vggt_model": ("VVL_VGGT_MODEL", {
                     "tooltip": "来自VVLVGGTLoader的VGGT模型实例，包含已加载的模型和设备信息"
                 }),
+                "images": ("IMAGE", {
+                    "tooltip": "图片序列输入（必需）- 支持1-200帧图像"
+                }),
             },
             "optional": {
-                "video": (IO.VIDEO, {
-                    "tooltip": "视频输入（可选）"
-                }),
-                "images": ("IMAGE", {
-                    "tooltip": "图片序列输入（可选）"
-                }),
                 "confidence_threshold": ("FLOAT", {
                     "default": 50.0, "min": 0.0, "max": 100.0, "step": 0.1,
                     "tooltip": "置信度阈值(%)，用于过滤3D点云中的低置信度点"
@@ -974,9 +1116,23 @@ class VGGTMultiInputNode:
             }
         }
 
-    RETURN_TYPES = ("STRING", "IMAGE", "STRING", "STRING")
-    RETURN_NAMES = ("intrinsics_json", "trajectory_preview", "poses_json", "model_3d_path")
+    # 返回同时包含原生和格式化内容，便于后续节点灵活使用
+    RETURN_TYPES = (
+        "RAW_VGGT_RESULT",   # 原生VGGT字典，包含Tensor等
+        "STRING",            # 相机intrinsic JSON
+        "IMAGE",             # 轨迹可视化预览
+        "STRING",            # 相机姿态JSON
+        "STRING",            # 点云/模型文件路径
+    )
+    RETURN_NAMES = (
+        "raw_result",
+        "intrinsics_json",
+        "trajectory_preview",
+        "poses_json",
+        "model_3d_path",
+    )
     OUTPUT_TOOLTIPS = [
+        "原生VGGT推理结果（包含所有Tensor数据）",
         "相机内参数据 (JSON格式)",
         "相机轨迹2D预览图像",
         "相机位姿数据 (JSON格式)",
@@ -1023,129 +1179,247 @@ class VGGTMultiInputNode:
         return frames
 
     def estimate_multi_input(self, vggt_model: Dict, 
-                           video=None, images=None,
+                           images,
                            confidence_threshold: float = 50.0,
                            show_cameras: bool = True,
                            mask_black_bg: bool = False,
                            mask_white_bg: bool = False,
                            mask_sky: bool = False):
-        """多输入方式的相机参数估计"""
+        """
+        VGGT多输入重建 - 使用原生VGGT算法
+        支持图片序列输入，输出原生结果
+        """
+        logger.info("开始VGGT原生多输入重建")
+        
+        # 获取模型实例和设备
+        model_instance = vggt_model.get("model")
+        device = vggt_model.get("device")
+        
+        if model_instance is None:
+            raise ValueError("无效的VGGT模型实例")
+        
+        logger.info(f"使用设备: {device}")
+        
+        # 处理图片序列输入
+        image_list = []
+        if isinstance(images, torch.Tensor):
+            # ComfyUI的IMAGE格式通常是 (batch, height, width, channels)
+            images_np = images.cpu().numpy()
+            for i in range(images_np.shape[0]):
+                img = images_np[i]
+                # 确保像素值在0-255范围内
+                if img.max() <= 1.0:
+                    img = (img * 255).astype(np.uint8)
+                else:
+                    img = img.astype(np.uint8)
+                image_list.append(img)
+        else:
+            image_list.extend(images)
+        
+        if not image_list:
+            raise ValueError("未能提取到有效的图像数据")
+        
+        logger.info(f"总共处理 {len(image_list)} 张图像")
+        
+        # 限制图像数量（避免内存溢出）
+        max_frames = 200
+        if len(image_list) > max_frames:
+            logger.warning(f"图像数量 ({len(image_list)}) 超过最大限制 ({max_frames})，将进行采样")
+            # 均匀采样
+            indices = np.linspace(0, len(image_list) - 1, max_frames, dtype=int)
+            image_list = [image_list[i] for i in indices]
+            logger.info(f"采样后图像数量: {len(image_list)}")
+        
         try:
-            # 检查VGGT工具函数是否可用
-            if not VGGT_UTILS_AVAILABLE:
-                raise RuntimeError(f"VGGT utils not available: {_VGGT_UTILS_IMPORT_ERROR}")
+            # 使用原生VGGT预处理
+            processed_images = preprocess_images_native(image_list)
+            processed_images = processed_images.to(device)
             
-            # 从模型字典中获取信息
-            model_instance = vggt_model['model']
-            device = vggt_model['device']
-            model_name = vggt_model['model_name']
-            
-            logger.info(f"VGGTMultiInputNode: Using {model_name} on {device}")
-            
-            # 确定输入源和处理方式
-            img_paths = []
-            
-            # 处理图片序列输入
-            if images is not None and images.shape[0] > 0:
-                logger.info(f"VGGTMultiInputNode: 处理图片序列输入，数量: {images.shape[0]}")
+            # 应用遮罩（如果需要）
+            if VGGT_NATIVE_AVAILABLE:
+                mask_types = []
+                if mask_black_bg:
+                    mask_types.append('black_bg')
+                if mask_white_bg:
+                    mask_types.append('white_bg')
+                if mask_sky:
+                    mask_types.append('sky')
                 
-                # 保存图片到临时文件
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    for i in range(images.shape[0]):
-                        img_tensor = images[i]
-                        
-                        # 确保数值范围正确
-                        if img_tensor.max() <= 1.0:
-                            img_np = (img_tensor.cpu().numpy() * 255).astype(np.uint8)
-                        else:
-                            img_np = img_tensor.cpu().numpy().astype(np.uint8)
-                        
-                        img_path = os.path.join(tmpdir, f"image_{i:04d}.png")
-                        Image.fromarray(img_np).save(img_path)
-                        img_paths.append(img_path)
-                    
-                    # 运行推理
-                    predictions = _run_vggt_model_inference(img_paths, model_instance, device)
+                for mask_type in mask_types:
+                    processed_images = VGGTImageProcessor.apply_masking(processed_images, mask_type)
             
-            # 处理视频输入
-            elif video is not None:
-                vid_path = self._resolve_video_path(video)
-                if not vid_path or not os.path.exists(vid_path):
-                    raise FileNotFoundError(f"找不到视频文件: {vid_path}")
-                
-                logger.info(f"VGGTMultiInputNode: 处理视频输入: {vid_path}")
-                
-                # 使用原版Gradio方式提取视频帧
-                frames = self._extract_video_frames_original(vid_path)
-                if not frames:
-                    raise RuntimeError("无法从视频中提取帧")
-                
-                # 保存帧到临时文件
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    for i, frame in enumerate(frames):
-                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        img_path = os.path.join(tmpdir, f"frame_{i:04d}.png")
-                        Image.fromarray(rgb).save(img_path)
-                        img_paths.append(img_path)
-                    
-                    # 运行推理
-                    predictions = _run_vggt_model_inference(img_paths, model_instance, device)
+            # 运行原生VGGT推理
+            raw_results = run_vggt_native_inference(processed_images, model_instance, device)
             
-            else:
-                raise ValueError("必须提供视频或图片序列输入")
+            # 格式化结果
+            formatted_results = format_results_native(raw_results)
+            
+            # 生成JSON输出
+            intrinsics_json = ""
+            poses_json = ""
+            if 'cameras' in formatted_results:
+                intrinsics_json = json.dumps(formatted_results['cameras']['json']['intrinsic_matrices'], indent=2)
+                poses_json = json.dumps(formatted_results['cameras']['json']['extrinsic_matrices'], indent=2)
+            
+            # 生成轨迹预览
+            trajectory_preview = _create_insufficient_data_image()  # 默认图像
+            if 'cameras' in raw_results:
+                try:
+                    trajectory_preview = _create_traj_preview(raw_results['cameras']['extrinsic'])
+                except Exception as e:
+                    logger.warning(f"轨迹预览生成失败: {e}")
             
             # 生成3D模型文件
-            model_3d_path, ui_result = _generate_3d_model_from_predictions(
-                predictions, filename_prefix="3d/vggt_model",
+            model_3d_path = ""
+            try:
+                # 使用官方VGGT的predictions_to_glb函数生成高质量3D模型
+                model_3d_path = self._generate_3d_model_official(
+                    raw_results, 
+                    confidence_threshold, 
+                    show_cameras,
+                    mask_black_bg,
+                    mask_white_bg,
+                    mask_sky
+                )
+            except Exception as e:
+                logger.warning(f"3D模型生成失败: {e}")
+            
+            logger.info("VGGT原生多输入重建完成")
+            return (raw_results, intrinsics_json, trajectory_preview, poses_json, model_3d_path)
+            
+        except Exception as e:
+            logger.error(f"VGGT原生推理失败: {e}")
+            # 返回错误信息
+            error_msg = f"VGGT原生推理失败: {str(e)}"
+            error_image = _create_insufficient_data_image()
+            empty_result = {}
+            return (empty_result, error_msg, error_image, error_msg, "")
+    
+    def _generate_3d_model_official(self, raw_results: Dict, confidence_threshold: float, show_cameras: bool, 
+                                   mask_black_bg: bool = False, mask_white_bg: bool = False, mask_sky: bool = False) -> str:
+        """使用官方VGGT的predictions_to_glb函数生成高质量3D模型"""
+        try:
+            import trimesh
+            
+            # 创建输出目录
+            output_dir = os.path.join(folder_paths.get_output_directory() if FOLDER_PATHS_AVAILABLE else "output", "3d")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 生成文件名
+            import time
+            timestamp = int(time.time())
+            model_path = os.path.join(output_dir, f"vggt_official_{timestamp}.glb")
+            
+            logger.info(f"save_glb: 开始保存GLB文件到 {model_path}")
+            
+            # 准备官方格式的预测数据 - 关键：使用depth-based points（官方推荐）
+            predictions_formatted = {
+                'world_points_from_depth': raw_results.get('points_from_depth'),
+                'depth_conf': raw_results.get('depth', {}).get('confidence') if 'depth' in raw_results else None,
+                'images': raw_results.get('images'),
+                'extrinsic': raw_results.get('cameras', {}).get('extrinsic') if 'cameras' in raw_results else None,
+            }
+            
+            # 检查数据是否完整
+            missing_fields = [k for k, v in predictions_formatted.items() if v is None]
+            if missing_fields:
+                logger.warning(f"Missing fields for predictions_to_glb: {missing_fields}")
+            
+            # 如果没有depth-based points，尝试使用原始点云
+            if predictions_formatted['world_points_from_depth'] is None:
+                if 'points' in raw_results:
+                    logger.info("Using point_map as fallback for world_points")
+                    predictions_formatted['world_points'] = raw_results['points']['point_map']
+                    predictions_formatted['world_points_conf'] = raw_results['points']['confidence']
+            
+            # 确保数据格式正确（转换为numpy）
+            for key, value in predictions_formatted.items():
+                if value is not None and isinstance(value, torch.Tensor):
+                    predictions_formatted[key] = value.cpu().numpy()
+            
+            # 使用官方VGGT的predictions_to_glb函数（优先使用depth-based points，质量更高）
+            scene_3d = predictions_to_glb(
+                predictions_formatted,
                 conf_thres=confidence_threshold,
-                show_cam=show_cameras,
+                filter_by_frames="all",
                 mask_black_bg=mask_black_bg,
                 mask_white_bg=mask_white_bg,
-                mask_sky=mask_sky
+                show_cam=show_cameras,
+                mask_sky=mask_sky,
+                target_dir=None,
+                prediction_mode="Depthmap and Camera Branch"  # 官方推荐模式
             )
-
-            # 生成JSON输出
-            source_type = "images" if images is not None else "video"
-            intrinsics_json, poses_json = _matrices_to_json(predictions["intrinsic"], predictions["extrinsic"], source_type)
-
-            # 生成轨迹预览图
-            extrinsic_tensor = torch.from_numpy(predictions["extrinsic"]).float()
-            traj_tensor = _create_traj_preview(extrinsic_tensor)
-
-            logger.info("VGGTMultiInputNode: Camera estimation completed successfully")
             
-            # 准备返回的3D模型路径
-            if model_3d_path and os.path.exists(model_3d_path):
-                # 使用ComfyUI的带注释路径格式
-                if FOLDER_PATHS_AVAILABLE:
-                    try:
-                        # 使用folder_paths.get_annotated_filepath来生成正确的路径格式
-                        annotated_path = folder_paths.get_annotated_filepath(model_3d_path)
-                        model_output_path = annotated_path
-                    except:
-                        # 备用方案：手动生成相对路径
-                        relative_path = os.path.relpath(model_3d_path, folder_paths.get_output_directory())
-                        model_output_path = f"{relative_path} [output]"
-                else:
-                    model_output_path = model_3d_path
-            else:
-                model_output_path = ""
+            # 导出为GLB文件
+            scene_3d.export(model_path)
             
-            # 返回结果，包括UI结果用于3D模型预览和直接的文件路径
-            result = (intrinsics_json, traj_tensor, poses_json, model_output_path)
-            if ui_result:
-                return {"ui": {"3d": [ui_result]}, "result": result}
-            else:
-                return {"result": result}
-
+            # 获取点云统计信息用于日志
+            point_clouds = [geom for geom in scene_3d.geometry.values() if isinstance(geom, trimesh.PointCloud)]
+            if point_clouds:
+                total_vertices = sum(len(pc.vertices) for pc in point_clouds)
+                logger.info(f"save_glb: 顶点形状 ({total_vertices}, 3), 使用官方VGGT高质量处理")
+            
+            logger.info(f"save_glb: GLB文件写入完成")
+            logger.info(f"3D模型已保存到: {model_path}")
+            return model_path
+            
         except Exception as e:
-            error_msg = f"VGGT多输入估计错误: {str(e)}"
-            logger.error(error_msg)
+            logger.error(f"生成3D模型失败: {e}")
+            # 回退到简单方法
+            return self._generate_3d_model_simple_fallback(raw_results, confidence_threshold)
+    
+    def _generate_3d_model_simple_fallback(self, raw_results: Dict, confidence_threshold: float) -> str:
+        """简单的3D模型生成回退方案"""
+        try:
+            # 创建输出目录
+            output_dir = os.path.join(folder_paths.get_output_directory() if FOLDER_PATHS_AVAILABLE else "output", "3d")
+            os.makedirs(output_dir, exist_ok=True)
             
-            # 返回错误结果
-            empty_img = torch.ones((1, 400, 400, 3), dtype=torch.float32) * 0.1
-            error_json = json.dumps({"success": False, "error": error_msg}, ensure_ascii=False, indent=2)
-            return {"result": (error_json, empty_img, error_json, "")}
+            # 生成文件名
+            import time
+            timestamp = int(time.time())
+            model_path = os.path.join(output_dir, f"vggt_fallback_{timestamp}.glb")
+            
+            # 从原生结果提取点云数据
+            if 'points_from_depth' in raw_results:
+                points = raw_results['points_from_depth']
+            elif 'points' in raw_results:
+                points = raw_results['points']['point_map']
+            else:
+                logger.warning("No point cloud data found in raw results")
+                return ""
+            
+            # 转换为numpy数组
+            if isinstance(points, torch.Tensor):
+                points_np = points.cpu().numpy()
+            else:
+                points_np = points
+            
+            # 重塑点云数据
+            if points_np.ndim == 4:  # (batch, height, width, 3)
+                points_np = points_np.reshape(-1, 3)
+            elif points_np.ndim == 3:  # (height, width, 3)
+                points_np = points_np.reshape(-1, 3)
+            
+            # 过滤无效点
+            valid_mask = ~np.isnan(points_np).any(axis=1)
+            points_np = points_np[valid_mask]
+            
+            if len(points_np) == 0:
+                logger.warning("No valid points found")
+                return ""
+            
+            # 简单的点云保存（只保存点，不生成面）
+            import trimesh
+            point_cloud = trimesh.PointCloud(vertices=points_np)
+            point_cloud.export(model_path)
+            
+            logger.info(f"3D模型已保存到: {model_path}")
+            return model_path
+            
+        except Exception as e:
+            logger.error(f"生成3D模型失败: {e}")
+            return ""
 
 # -----------------------------------------------------------------------------
 # 原版VGGT的predictions_to_glb函数和所有辅助函数（完整移植自visual_util.py）
