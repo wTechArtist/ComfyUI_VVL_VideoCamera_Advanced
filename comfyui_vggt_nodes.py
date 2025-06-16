@@ -1313,11 +1313,67 @@ class VGGTMultiInputNode:
             logger.info(f"save_glb: 开始保存GLB文件到 {model_path}")
             
             # 准备官方格式的预测数据 - 关键：使用depth-based points（官方推荐）
+            # depth/confidence、camera 外参在不同实现中可能直接展开为Tensor，
+            # 也可能包在 dict 里；这里做兼容处理。
+
+            # world_points_from_depth
+            world_points_from_depth = raw_results.get('points_from_depth')
+
+            # depth_conf: 兼容多种返回格式
+            depth_conf = None
+            if 'depth' in raw_results:
+                if isinstance(raw_results['depth'], dict):
+                    depth_conf = raw_results['depth'].get('confidence')
+                else:
+                    # 旧实现中 depth_conf 可能单独返回
+                    depth_conf = raw_results.get('depth_conf')
+
+            # images
+            images_tensor = raw_results.get('images')
+
+            # extrinsic
+            extrinsic_mat = None
+            if 'cameras' in raw_results:
+                if isinstance(raw_results['cameras'], dict):
+                    extrinsic_mat = raw_results['cameras'].get('extrinsic')
+                else:
+                    extrinsic_mat = raw_results.get('extrinsic')
+
+            # 特别处理 extrinsic: 去掉 batch 维 (1, S, 3, 4) -> (S, 3, 4)
+            if isinstance(extrinsic_mat, torch.Tensor):
+                if extrinsic_mat.ndim == 4 and extrinsic_mat.shape[0] == 1:
+                    extrinsic_mat = extrinsic_mat.squeeze(0)  # (1, S, 3, 4) -> (S, 3, 4)
+            elif isinstance(extrinsic_mat, np.ndarray):
+                if extrinsic_mat.ndim == 4 and extrinsic_mat.shape[0] == 1:
+                    extrinsic_mat = np.squeeze(extrinsic_mat, axis=0)  # (1, S, 3, 4) -> (S, 3, 4)
+
+            # -------- 维度兼容处理 ---------
+            # images 期望 (S,H,W,3) 或 (S,3,H,W)。如果带 batch 维(1,S,3,H,W)，先去掉 batch 维。
+            images_tensor_proc = images_tensor
+            if isinstance(images_tensor_proc, torch.Tensor):
+                if images_tensor_proc.ndim == 5 and images_tensor_proc.shape[0] == 1:
+                    images_tensor_proc = images_tensor_proc.squeeze(0)
+            elif isinstance(images_tensor_proc, np.ndarray):
+                if images_tensor_proc.ndim == 5 and images_tensor_proc.shape[0] == 1:
+                    images_tensor_proc = np.squeeze(images_tensor_proc, axis=0)
+
+            # world_points_from_depth 也去 batch 维(1, S, H, W, 3)
+            wpfd_proc = world_points_from_depth
+            if isinstance(wpfd_proc, torch.Tensor):
+                if wpfd_proc is not None and wpfd_proc.ndim == 5 and wpfd_proc.shape[0] == 1:
+                    wpfd_proc = wpfd_proc.squeeze(0)
+            elif isinstance(wpfd_proc, np.ndarray):
+                if wpfd_proc is not None and wpfd_proc.ndim == 5 and wpfd_proc.shape[0] == 1:
+                    wpfd_proc = np.squeeze(wpfd_proc, axis=0)
+
+            images_tensor = images_tensor_proc
+            world_points_from_depth = wpfd_proc
+
             predictions_formatted = {
-                'world_points_from_depth': raw_results.get('points_from_depth'),
-                'depth_conf': raw_results.get('depth', {}).get('confidence') if 'depth' in raw_results else None,
-                'images': raw_results.get('images'),
-                'extrinsic': raw_results.get('cameras', {}).get('extrinsic') if 'cameras' in raw_results else None,
+                'world_points_from_depth': world_points_from_depth,
+                'depth_conf': depth_conf,
+                'images': images_tensor,
+                'extrinsic': extrinsic_mat,
             }
             
             # 检查数据是否完整
@@ -1337,6 +1393,16 @@ class VGGTMultiInputNode:
                 if value is not None and isinstance(value, torch.Tensor):
                     predictions_formatted[key] = value.cpu().numpy()
             
+            # ===== 关键修复：extrinsic 格式转换 =====
+            # 官方 predictions_to_glb 期望 extrinsic 是 (S, 3, 4)，但后续处理需要转为 (S, 4, 4)
+            # 我们需要确保格式完全符合官方期望
+            if predictions_formatted['extrinsic'] is not None:
+                extrinsic_arr = predictions_formatted['extrinsic']
+                if extrinsic_arr.shape[-2:] == (3, 4):  # (S, 3, 4) -> 保持原样，官方会自动处理
+                    logger.info(f"extrinsic shape: {extrinsic_arr.shape} - 格式正确")
+                else:
+                    logger.warning(f"extrinsic shape: {extrinsic_arr.shape} - 格式可能不兼容")
+
             # 使用官方VGGT的predictions_to_glb函数（优先使用depth-based points，质量更高）
             scene_3d = predictions_to_glb(
                 predictions_formatted,
@@ -1605,7 +1671,13 @@ def predictions_to_glb(
     # Prepare 4x4 matrices for camera extrinsics
     num_cameras = len(camera_matrices)
     extrinsics_matrices = np.zeros((num_cameras, 4, 4))
-    extrinsics_matrices[:, :3, :4] = camera_matrices
+    # 确保维度匹配：camera_matrices 应该是 (num_cameras, 3, 4)
+    if camera_matrices.ndim == 3 and camera_matrices.shape[1:] == (3, 4):
+        extrinsics_matrices[:, :3, :4] = camera_matrices
+    else:
+        # 如果形状不匹配，尝试修复
+        camera_matrices_reshaped = camera_matrices.reshape(num_cameras, 3, 4)
+        extrinsics_matrices[:, :3, :4] = camera_matrices_reshaped
     extrinsics_matrices[:, 3, 3] = 1
 
     if show_cam:
