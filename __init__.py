@@ -5,17 +5,20 @@ ComfyUI VVL Video Camera Advanced
 
 from .comfyui_vggt_nodes import VGGTMultiInputNode
 from .vggt_model_loader import VVLVGGTLoader
+from .glb_point_cloud_processor import GLBPointCloudProcessor
 
 # 节点类映射
 NODE_CLASS_MAPPINGS = {
     "VVLVGGTLoader": VVLVGGTLoader,
-    "VGGTMultiInputNode": VGGTMultiInputNode,
+    "VGGTMultiInputNode": VGGTMultiInputNode,   
+    "GLBPointCloudProcessor": GLBPointCloudProcessor,
 }
 
 # 节点显示名称映射
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "VVLVGGTLoader": "VGGT 模型加载器",
-    "VGGTMultiInputNode": "VGGT 多输入重建",
+    "VVLVGGTLoader": "VVL VGGT 模型加载器",
+    "VGGTMultiInputNode": "VVL VGGT 多输入重建",
+    "GLBPointCloudProcessor": "VVL GLB 点云黑色点清理",
 }
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']

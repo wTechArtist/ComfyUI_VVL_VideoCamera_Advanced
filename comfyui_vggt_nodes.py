@@ -2097,4 +2097,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 # 如果模型加载器可用，添加到映射中
 if MODEL_LOADER_AVAILABLE:
     NODE_CLASS_MAPPINGS["VVLVGGTLoader"] = VVLVGGTLoader
-    NODE_DISPLAY_NAME_MAPPINGS["VVLVGGTLoader"] = "VVL VGGT Model Loader" 
+    NODE_DISPLAY_NAME_MAPPINGS["VVLVGGTLoader"] = "VVL VGGT Model Loader"
+
+# 注意：GLBPointCloudProcessor现在在独立文件中自行注册
+# 无需在此文件中导入，ComfyUI会自动发现glb_point_cloud_processor.py 
