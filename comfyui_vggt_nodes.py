@@ -1094,7 +1094,7 @@ class VGGTMultiInputNode:
             },
             "optional": {
                 "confidence_threshold": ("FLOAT", {
-                    "default": 50.0, "min": 0.0, "max": 100.0, "step": 0.1,
+                    "default": 90.0, "min": 0.0, "max": 100.0, "step": 0.1,
                     "tooltip": "置信度阈值(%)，用于过滤3D点云中的低置信度点"
                 }),
                 "show_cameras": ("BOOLEAN", {

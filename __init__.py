@@ -13,6 +13,7 @@ NODE_CLASS_MAPPINGS = {
     "VGGTMultiInputNode": VGGTMultiInputNode,   
     "GLBPointCloudProcessor": GLBPointCloudProcessor,
     "GLBPointCloudBounds": GLBPointCloudBounds,
+    "GLBPointCloudOriginAdjuster": GLBPointCloudOriginAdjuster,
 }
 
 # 节点显示名称映射
@@ -21,6 +22,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VGGTMultiInputNode": "VVL VGGT 多输入重建",
     "GLBPointCloudProcessor": "VVL GLB 点云黑色点清理",
     "GLBPointCloudBounds": "VVL GLB 点云包围盒计算",
+    "GLBPointCloudOriginAdjuster": "VVL GLB 点云原点调整",
 }
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
