@@ -529,20 +529,61 @@ def _matrices_to_json(intrinsic, extrinsic, source_type="video") -> (str, str):
         json.dumps(poses_data, ensure_ascii=False, indent=2),
     )
 
-def _create_traj_preview(extrinsic: torch.Tensor) -> torch.Tensor:
+def _create_traj_preview(extrinsic) -> torch.Tensor:
     """根据相机外参创建3D轨迹可视化（使用matplotlib 3D绘图）。"""
-    ext = extrinsic.cpu().numpy()  # (N,3,4)
+    # 支持torch.Tensor和numpy.ndarray输入
+    if isinstance(extrinsic, torch.Tensor):
+        ext = extrinsic.cpu().numpy()
+    elif isinstance(extrinsic, np.ndarray):
+        ext = extrinsic
+    else:
+        print(f"VGGT: 不支持的外参数据类型: {type(extrinsic)}")
+        return _create_insufficient_data_image()
+    
+    print(f"VGGT: 轨迹预览处理外参矩阵形状: {ext.shape}")
+    
     positions = []
     orientations = []
     
-    for mat in ext:
-        R = mat[:3, :3]
-        t = mat[:3, 3]
-        pos = -R.T @ t  # 相机在世界坐标系中的位置
+    # 检查矩阵形状并相应处理
+    if len(ext.shape) == 3 and ext.shape[-1] == 4:  # (N, 3, 4) 格式
+        print(f"VGGT: 使用完整外参矩阵 (N, 3, 4)")
+        for mat in ext:
+            R = mat[:3, :3]
+            t = mat[:3, 3]
+            pos = -R.T @ t  # 相机在世界坐标系中的位置
+            positions.append(pos)
+            # 提取相机朝向（Z轴方向）
+            forward = -R[:, 2]  # 相机朝向（Z轴负方向）
+            orientations.append(forward)
+    elif len(ext.shape) == 3 and ext.shape[-1] == 3:  # (N, 3, 3) 格式，只有旋转矩阵
+        print(f"VGGT: 外参矩阵只包含旋转信息 {ext.shape}，使用索引作为位置")
+        for i, mat in enumerate(ext):
+            R = mat[:3, :3]
+            # 没有平移信息，使用索引作为位置
+            pos = np.array([i * 1.0, 0.0, 0.0])  # 简单的线性排列
+            positions.append(pos)
+            # 提取相机朝向（Z轴方向）
+            forward = -R[:, 2]  # 相机朝向（Z轴负方向）
+            orientations.append(forward)
+    elif len(ext.shape) == 2 and ext.shape == (3, 4):  # 单个 (3, 4) 矩阵
+        print(f"VGGT: 单个外参矩阵 (3, 4)")
+        R = ext[:3, :3]
+        t = ext[:3, 3]
+        pos = -R.T @ t
         positions.append(pos)
-        # 提取相机朝向（Z轴方向）
-        forward = -R[:, 2]  # 相机朝向（Z轴负方向）
+        forward = -R[:, 2]
         orientations.append(forward)
+    elif len(ext.shape) == 2 and ext.shape == (3, 3):  # 单个 (3, 3) 矩阵
+        print(f"VGGT: 单个旋转矩阵 (3, 3)")
+        R = ext[:3, :3]
+        pos = np.array([0.0, 0.0, 0.0])  # 原点位置
+        positions.append(pos)
+        forward = -R[:, 2]
+        orientations.append(forward)
+    else:
+        print(f"VGGT: 不支持的外参矩阵形状: {ext.shape}")
+        return _create_insufficient_data_image()
     
     positions = np.array(positions)
     orientations = np.array(orientations)
@@ -1265,9 +1306,22 @@ class VGGTMultiInputNode:
             trajectory_preview = _create_insufficient_data_image()  # 默认图像
             if 'cameras' in raw_results:
                 try:
-                    trajectory_preview = _create_traj_preview(raw_results['cameras']['extrinsic'])
+                    extrinsic_for_preview = raw_results['cameras']['extrinsic']
+                    
+                    # 应用与GLB生成相同的维度处理逻辑
+                    if isinstance(extrinsic_for_preview, torch.Tensor):
+                        if extrinsic_for_preview.ndim == 4 and extrinsic_for_preview.shape[0] == 1:
+                            extrinsic_for_preview = extrinsic_for_preview.squeeze(0)  # (1, S, 3, 4) -> (S, 3, 4)
+                    elif isinstance(extrinsic_for_preview, np.ndarray):
+                        if extrinsic_for_preview.ndim == 4 and extrinsic_for_preview.shape[0] == 1:
+                            extrinsic_for_preview = np.squeeze(extrinsic_for_preview, axis=0)  # (1, S, 3, 4) -> (S, 3, 4)
+                    
+                    logger.info(f"轨迹预览外参形状: {extrinsic_for_preview.shape}")
+                    trajectory_preview = _create_traj_preview(extrinsic_for_preview)
                 except Exception as e:
                     logger.warning(f"轨迹预览生成失败: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             # 生成3D模型文件
             model_3d_path = ""
