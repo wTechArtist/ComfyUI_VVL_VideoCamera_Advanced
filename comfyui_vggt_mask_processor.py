@@ -937,10 +937,10 @@ def create_simple_spatial_segmentation(points: np.ndarray, mask_sequence: List[n
     logger.info(f"简单分割选择了 {np.sum(segment_mask)} 个点")
     return full_mask
 
-def create_segmented_pointcloud_new(raw_vggt_result: Dict, mask_sequence: List[np.ndarray], 
-                                   target_object_id: int = None) -> Tuple[np.ndarray, np.ndarray]:
+def create_segmented_pointcloud_with_spatial_preservation(raw_vggt_result: Dict, mask_sequence: List[np.ndarray], 
+                                                      target_object_id: int = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, tuple]:
     """
-    基于mask序列创建分割点云（新的正确方法）
+    创建保持原始空间对应关系的分割点云
     
     Args:
         raw_vggt_result: VGGT原生结果
@@ -948,13 +948,12 @@ def create_segmented_pointcloud_new(raw_vggt_result: Dict, mask_sequence: List[n
         target_object_id: 目标物体ID，None表示保留所有非背景点
     
     Returns:
-        vertices: 点云顶点坐标 (N, 3)
-        colors: 点云颜色 (N, 3)
+        original_points: 完整的原始点云 (N, 3) - 保持原始顺序和坐标
+        segmented_points: 分割后的物体点云 (M, 3) - M是物体点数量
+        segment_mask: 布尔掩码 (N,) - 指示哪些原始点属于目标物体
+        original_shape: 原始点云的形状信息
     """
-    logger.info(f"使用新方法创建分割点云，目标物体ID: {target_object_id}，启用自动阈值检测")
-    
-    # 获取完整点云的分割mask
-    segment_mask = create_mask_based_segmentation(raw_vggt_result, mask_sequence, target_object_id)
+    logger.info(f"创建保持空间对应关系的分割点云，目标物体ID: {target_object_id}")
     
     # 获取点云数据
     if 'points_from_depth' in raw_vggt_result:
@@ -969,21 +968,75 @@ def create_segmented_pointcloud_new(raw_vggt_result: Dict, mask_sequence: List[n
     else:
         raise ValueError("No point cloud data found in raw_vggt_result")
     
-    # 转换为numpy
+    # 转换为numpy并保存原始形状
     if isinstance(points, torch.Tensor):
         points_np = points.cpu().numpy()
     else:
         points_np = points
     
-    # 去掉batch维度
-    if points_np.ndim == 5 and points_np.shape[0] == 1:
-        points_np = np.squeeze(points_np, axis=0)
+    # 记录原始形状
+    original_shape = points_np.shape
+    logger.info(f"原始点云形状: {original_shape}")
     
-    # 重塑为点云 (N_points, 3)
-    if points_np.ndim == 4:
-        points_np = points_np.reshape(-1, 3)
+    # 去掉batch维度但保持空间结构
+    if points_np.ndim == 5 and points_np.shape[0] == 1:
+        points_np = np.squeeze(points_np, axis=0)  # 现在是 (S, H, W, 3)
+        original_shape = points_np.shape
+    
+    # 保存原始点云的完整副本（保持原始坐标和顺序）
+    if points_np.ndim == 4:  # (S, H, W, 3)
+        S, H, W, _ = points_np.shape
+        original_points_flat = points_np.reshape(-1, 3)  # 展平但保持顺序
     elif points_np.ndim == 3:
-        points_np = points_np.reshape(-1, 3)
+        original_points_flat = points_np.reshape(-1, 3)
+    else:
+        original_points_flat = points_np
+    
+    logger.info(f"原始点云总数: {len(original_points_flat)}")
+    
+    # 获取分割mask（这个mask对应扁平化后的点云）
+    segment_mask = create_mask_based_segmentation(raw_vggt_result, mask_sequence, target_object_id)
+    
+    # 确保mask长度匹配
+    if len(segment_mask) != len(original_points_flat):
+        logger.warning(f"分割mask长度({len(segment_mask)})与点云长度({len(original_points_flat)})不匹配")
+        min_len = min(len(segment_mask), len(original_points_flat))
+        segment_mask = segment_mask[:min_len]
+        original_points_flat = original_points_flat[:min_len]
+    
+    # 应用分割mask获取物体点
+    segmented_points = original_points_flat[segment_mask]
+    
+    # 统计信息
+    total_points = len(original_points_flat)
+    object_points = len(segmented_points)
+    object_ratio = object_points / total_points * 100 if total_points > 0 else 0
+    
+    logger.info(f"空间保持分割结果: 总点数={total_points}, 物体点数={object_points}, 物体占比={object_ratio:.1f}%")
+    
+    return original_points_flat, segmented_points, segment_mask, original_shape
+
+def create_segmented_pointcloud_new(raw_vggt_result: Dict, mask_sequence: List[np.ndarray], 
+                                   target_object_id: int = None) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    基于mask序列创建分割点云（新的正确方法）
+    现在使用空间保持方法来确保坐标对应
+    
+    Args:
+        raw_vggt_result: VGGT原生结果
+        mask_sequence: mask图像序列
+        target_object_id: 目标物体ID，None表示保留所有非背景点
+    
+    Returns:
+        vertices: 点云顶点坐标 (N, 3) - 保持原始坐标系
+        colors: 点云颜色 (N, 3)
+    """
+    logger.info(f"使用空间保持方法创建分割点云，目标物体ID: {target_object_id}")
+    
+    # 使用新的空间保持方法
+    original_points, segmented_points, segment_mask, original_shape = create_segmented_pointcloud_with_spatial_preservation(
+        raw_vggt_result, mask_sequence, target_object_id
+    )
     
     # 获取颜色数据
     colors_np = None
@@ -1001,28 +1054,28 @@ def create_segmented_pointcloud_new(raw_vggt_result: Dict, mask_sequence: List[n
             if images_np.shape[1] == 3:  # (S, 3, H, W) -> (S, H, W, 3)
                 images_np = np.transpose(images_np, (0, 2, 3, 1))
             
-            colors_np = images_np.reshape(-1, 3)
-            if colors_np.max() <= 1.0:
-                colors_np = (colors_np * 255).astype(np.uint8)
+            # 展平颜色数据（保持与点云相同的顺序）
+            colors_flat = images_np.reshape(-1, 3)
+            if colors_flat.max() <= 1.0:
+                colors_flat = (colors_flat * 255).astype(np.uint8)
             else:
-                colors_np = colors_np.astype(np.uint8)
+                colors_flat = colors_flat.astype(np.uint8)
+            
+            # 确保颜色数据长度匹配
+            if len(colors_flat) != len(original_points):
+                logger.warning(f"颜色数据长度({len(colors_flat)})与点云长度({len(original_points)})不匹配")
+                min_len = min(len(colors_flat), len(original_points))
+                colors_flat = colors_flat[:min_len]
+            
+            # 应用同样的分割mask获取对应的颜色
+            if len(colors_flat) >= len(segment_mask):
+                colors_np = colors_flat[segment_mask]
+            else:
+                logger.warning("颜色数据不足，使用默认颜色")
+                colors_np = None
     
-    # 确保segment_mask长度匹配
-    if len(segment_mask) != len(points_np):
-        logger.warning(f"Segment mask长度({len(segment_mask)})与点云长度({len(points_np)})不匹配，调整...")
-        min_len = min(len(segment_mask), len(points_np))
-        segment_mask = segment_mask[:min_len]
-        points_np = points_np[:min_len]
-        if colors_np is not None:
-            colors_np = colors_np[:min_len]
-    
-    # 应用分割mask
-    segmented_points = points_np[segment_mask]
-    
-    if colors_np is not None:
-        segmented_colors = colors_np[segment_mask]
-    else:
-        # 生成默认颜色
+    # 如果没有颜色数据或颜色数据处理失败，生成默认颜色
+    if colors_np is None:
         if target_object_id is not None and target_object_id > 0:
             # 为不同物体分配不同颜色
             colors = [
@@ -1036,12 +1089,12 @@ def create_segmented_pointcloud_new(raw_vggt_result: Dict, mask_sequence: List[n
                 [128, 0, 255],  # 紫色
             ]
             color = colors[target_object_id % len(colors)]
-            segmented_colors = np.tile(color, (len(segmented_points), 1)).astype(np.uint8)
+            colors_np = np.tile(color, (len(segmented_points), 1)).astype(np.uint8)
         else:
-            segmented_colors = np.ones((len(segmented_points), 3), dtype=np.uint8) * 128
+            colors_np = np.ones((len(segmented_points), 3), dtype=np.uint8) * 128
     
-    logger.info(f"新方法分割后保留 {len(segmented_points)} 个点")
-    return segmented_points, segmented_colors
+    logger.info(f"空间保持分割完成: 保留 {len(segmented_points)} 个点，坐标系保持不变")
+    return segmented_points, colors_np
 
 def create_segmented_pointcloud(raw_vggt_result: Dict, point_labels: Dict[int, List[int]], 
                                target_object_id: int = None) -> Tuple[np.ndarray, np.ndarray]:
@@ -1120,6 +1173,257 @@ def create_segmented_pointcloud(raw_vggt_result: Dict, point_labels: Dict[int, L
     logger.info(f"旧方法兼容模式，保留 {len(sample_points)} 个点")
     return sample_points, colors_np
 
+def create_segmented_pointcloud_glb_quality(raw_vggt_result: Dict, mask_sequence: List[np.ndarray], 
+                                           target_object_id: int = None) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    创建与GLB质量一致的分割点云
+    使用predictions_to_glb函数进行高质量过滤，然后应用分割mask
+    
+    Args:
+        raw_vggt_result: VGGT原生结果
+        mask_sequence: mask图像序列
+        target_object_id: 目标物体ID，None表示保留所有非背景点
+    
+    Returns:
+        vertices: 高质量分割点云顶点坐标 (N, 3)
+        colors: 对应的颜色 (N, 3)
+    """
+    logger.info(f"创建与GLB质量一致的分割点云，目标物体ID: {target_object_id}")
+    
+    # 检查是否有predictions_to_glb函数
+    if not VGGT_UTILS_AVAILABLE or not predictions_to_glb:
+        logger.warning("predictions_to_glb不可用，回退到原方法")
+        return create_segmented_pointcloud_new(raw_vggt_result, mask_sequence, target_object_id)
+    
+    try:
+        # 先使用predictions_to_glb生成高质量的完整点云
+        logger.info("第一步：使用predictions_to_glb生成高质量完整点云")
+        
+        # 准备与GLB相同的数据格式
+        world_points_from_depth = raw_vggt_result.get('points_from_depth')
+        
+        # depth_conf: 兼容多种返回格式
+        depth_conf = None
+        if 'depth' in raw_vggt_result:
+            if isinstance(raw_vggt_result['depth'], dict):
+                depth_conf = raw_vggt_result['depth'].get('confidence')
+            else:
+                depth_conf = raw_vggt_result.get('depth_conf')
+        
+        # images
+        images_tensor = raw_vggt_result.get('images')
+        
+        # extrinsic
+        extrinsic_mat = None
+        if 'cameras' in raw_vggt_result:
+            if isinstance(raw_vggt_result['cameras'], dict):
+                extrinsic_mat = raw_vggt_result['cameras'].get('extrinsic')
+            else:
+                extrinsic_mat = raw_vggt_result.get('extrinsic')
+        
+        # 维度处理
+        if isinstance(extrinsic_mat, torch.Tensor):
+            if extrinsic_mat.ndim == 4 and extrinsic_mat.shape[0] == 1:
+                extrinsic_mat = extrinsic_mat.squeeze(0)
+        elif isinstance(extrinsic_mat, np.ndarray):
+            if extrinsic_mat.ndim == 4 and extrinsic_mat.shape[0] == 1:
+                extrinsic_mat = np.squeeze(extrinsic_mat, axis=0)
+        
+        # 处理其他数据
+        images_tensor_proc = images_tensor
+        if isinstance(images_tensor_proc, torch.Tensor):
+            if images_tensor_proc.ndim == 5 and images_tensor_proc.shape[0] == 1:
+                images_tensor_proc = images_tensor_proc.squeeze(0)
+        elif isinstance(images_tensor_proc, np.ndarray):
+            if images_tensor_proc.ndim == 5 and images_tensor_proc.shape[0] == 1:
+                images_tensor_proc = np.squeeze(images_tensor_proc, axis=0)
+        
+        wpfd_proc = world_points_from_depth
+        if isinstance(wpfd_proc, torch.Tensor):
+            if wpfd_proc is not None and wpfd_proc.ndim == 5 and wpfd_proc.shape[0] == 1:
+                wpfd_proc = wpfd_proc.squeeze(0)
+        elif isinstance(wpfd_proc, np.ndarray):
+            if wpfd_proc is not None and wpfd_proc.ndim == 5 and wpfd_proc.shape[0] == 1:
+                wpfd_proc = np.squeeze(wpfd_proc, axis=0)
+        
+        predictions_formatted = {
+            'world_points_from_depth': wpfd_proc,
+            'depth_conf': depth_conf,
+            'images': images_tensor_proc,
+            'extrinsic': extrinsic_mat,
+        }
+        
+        # 回退到原始点云
+        if predictions_formatted['world_points_from_depth'] is None:
+            if 'points' in raw_vggt_result:
+                logger.info("Using point_map as fallback for world_points")
+                if isinstance(raw_vggt_result['points'], dict):
+                    predictions_formatted['world_points'] = raw_vggt_result['points']['point_map']
+                    predictions_formatted['world_points_conf'] = raw_vggt_result['points']['confidence']
+                else:
+                    predictions_formatted['world_points'] = raw_vggt_result['points']
+        
+        # 转换为numpy
+        for key, value in predictions_formatted.items():
+            if value is not None and isinstance(value, torch.Tensor):
+                predictions_formatted[key] = value.cpu().numpy()
+        
+        # 使用predictions_to_glb生成高质量3D场景
+        scene_3d = predictions_to_glb(
+            predictions_formatted,
+            conf_thres=90.0,  # 使用高置信度阈值保证质量
+            filter_by_frames="all",
+            mask_black_bg=False,
+            mask_white_bg=False,
+            show_cam=False,  # 只要点云
+            mask_sky=False,
+            target_dir=None,
+            prediction_mode="Depthmap and Camera Branch"
+        )
+        
+        # 从3D场景提取高质量点云
+        vertices_list = []
+        colors_list = []
+        
+        for geometry in scene_3d.geometry.values():
+            if hasattr(geometry, 'vertices') and hasattr(geometry, 'visual'):
+                vertices = np.array(geometry.vertices)
+                vertices_list.append(vertices)
+                
+                if hasattr(geometry.visual, 'vertex_colors'):
+                    colors = np.array(geometry.visual.vertex_colors)[:, :3]
+                    colors_list.append(colors)
+                elif hasattr(geometry.visual, 'face_colors'):
+                    face_colors = np.array(geometry.visual.face_colors)[:, :3]
+                    vertex_colors = np.tile(face_colors[0] if len(face_colors) > 0 else [128, 128, 128], 
+                                          (len(vertices), 1))
+                    colors_list.append(vertex_colors)
+                else:
+                    default_colors = np.ones((len(vertices), 3), dtype=np.uint8) * 128
+                    colors_list.append(default_colors)
+        
+        if not vertices_list:
+            logger.warning("没有从3D场景提取到点云，回退到原方法")
+            return create_segmented_pointcloud_new(raw_vggt_result, mask_sequence, target_object_id)
+        
+        # 合并高质量点云
+        high_quality_vertices = np.vstack(vertices_list)
+        high_quality_colors = np.vstack(colors_list)
+        
+        # 确保颜色格式正确
+        if high_quality_colors.max() <= 1.0:
+            high_quality_colors = (high_quality_colors * 255).astype(np.uint8)
+        else:
+            high_quality_colors = high_quality_colors.astype(np.uint8)
+        
+        logger.info(f"第一步完成：获得 {len(high_quality_vertices)} 个高质量点")
+        
+        # 第二步：应用mask分割到高质量点云
+        logger.info("第二步：对高质量点云应用mask分割")
+        
+        # 需要将高质量点云映射回原始图像空间进行分割
+        # 这里使用投影方法或空间对应关系
+        
+        # 获取分割mask（使用原始方法）
+        segment_mask_full = create_mask_based_segmentation(raw_vggt_result, mask_sequence, target_object_id)
+        
+        # 获取原始点云用于空间对应
+        if 'points_from_depth' in raw_vggt_result:
+            original_points_raw = raw_vggt_result['points_from_depth']
+        elif 'points' in raw_vggt_result:
+            if isinstance(raw_vggt_result['points'], dict):
+                original_points_raw = raw_vggt_result['points']['point_map']
+            else:
+                original_points_raw = raw_vggt_result['points']
+        else:
+            logger.warning("无法获取原始点云进行对应，回退到原方法")
+            return create_segmented_pointcloud_new(raw_vggt_result, mask_sequence, target_object_id)
+        
+        # 转换原始点云
+        if isinstance(original_points_raw, torch.Tensor):
+            original_points_np = original_points_raw.cpu().numpy()
+        else:
+            original_points_np = original_points_raw
+        
+        if original_points_np.ndim == 5 and original_points_np.shape[0] == 1:
+            original_points_np = np.squeeze(original_points_np, axis=0)
+        
+        if original_points_np.ndim == 4:
+            original_points_flat = original_points_np.reshape(-1, 3)
+        else:
+            original_points_flat = original_points_np.reshape(-1, 3)
+        
+        # 过滤无效原始点
+        valid_original_mask = ~np.isnan(original_points_flat).any(axis=1) & ~np.isinf(original_points_flat).any(axis=1)
+        valid_original_points = original_points_flat[valid_original_mask]
+        
+        # 调整segment_mask长度匹配
+        if len(segment_mask_full) != len(original_points_flat):
+            min_len = min(len(segment_mask_full), len(original_points_flat))
+            segment_mask_full = segment_mask_full[:min_len]
+            valid_original_mask = valid_original_mask[:min_len]
+        
+        # 获取分割后的原始点
+        segment_mask_valid = segment_mask_full[valid_original_mask]
+        segmented_original_points = valid_original_points[segment_mask_valid]
+        
+        if len(segmented_original_points) == 0:
+            logger.warning("分割后没有找到物体点，返回空结果")
+            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3)
+        
+        logger.info(f"原始分割找到 {len(segmented_original_points)} 个物体点")
+        
+        # 第三步：在高质量点云中找到最接近的点
+        logger.info("第三步：在高质量点云中匹配分割点")
+        
+        # 使用KDTree进行快速最近邻搜索
+        try:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(high_quality_vertices)
+            distances, indices = tree.query(segmented_original_points, k=1)
+            
+            # 过滤距离过远的点（可能是噪声）
+            distance_threshold = np.percentile(distances, 95)  # 使用95百分位作为阈值
+            valid_matches = distances <= distance_threshold
+            
+            matched_indices = indices[valid_matches]
+            final_vertices = high_quality_vertices[matched_indices]
+            final_colors = high_quality_colors[matched_indices]
+            
+            logger.info(f"第三步完成：匹配到 {len(final_vertices)} 个高质量分割点")
+            logger.info(f"平均匹配距离: {np.mean(distances[valid_matches]):.4f}")
+            
+            return final_vertices, final_colors
+            
+        except ImportError:
+            logger.warning("scipy不可用，使用简化匹配方法")
+            # 简化方法：直接使用空间位置筛选
+            
+            # 计算分割区域的边界
+            min_coords = np.min(segmented_original_points, axis=0)
+            max_coords = np.max(segmented_original_points, axis=0)
+            
+            # 在高质量点云中找到在边界内的点
+            mask_x = (high_quality_vertices[:, 0] >= min_coords[0]) & (high_quality_vertices[:, 0] <= max_coords[0])
+            mask_y = (high_quality_vertices[:, 1] >= min_coords[1]) & (high_quality_vertices[:, 1] <= max_coords[1])
+            mask_z = (high_quality_vertices[:, 2] >= min_coords[2]) & (high_quality_vertices[:, 2] <= max_coords[2])
+            
+            region_mask = mask_x & mask_y & mask_z
+            
+            final_vertices = high_quality_vertices[region_mask]
+            final_colors = high_quality_colors[region_mask]
+            
+            logger.info(f"简化匹配完成：找到 {len(final_vertices)} 个区域内高质量点")
+            
+            return final_vertices, final_colors
+        
+    except Exception as e:
+        logger.error(f"GLB质量分割失败: {e}")
+        import traceback
+        traceback.print_exc()
+        logger.info("回退到原分割方法")
+        return create_segmented_pointcloud_new(raw_vggt_result, mask_sequence, target_object_id)
+
 # -----------------------------------------------------------------------------
 # 主要节点实现
 # -----------------------------------------------------------------------------
@@ -1158,6 +1462,18 @@ class VGGTMaskProcessorNode:
                     "default": True,
                     "tooltip": "是否使用完整点云分割（推荐）。如果关闭，仅使用tracks点进行分割"
                 }),
+                "preserve_spatial_correspondence": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "是否保持与原始点云的空间对应关系（强烈推荐），确保分割后的点云坐标与原点云完全一致"
+                }),
+                "export_full_pointcloud_with_mask": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "是否同时导出包含分割mask信息的完整点云文件"
+                }),
+                "use_glb_quality_filtering": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "是否使用与GLB模型相同的高质量过滤算法（强烈推荐），确保分割点云质量与GLB输出一致"
+                }),
             }
         }
 
@@ -1166,18 +1482,21 @@ class VGGTMaskProcessorNode:
         "STRING",            # PLY文件路径
         "STRING",            # GLB文件路径  
         "STRING",            # 分割报告
+        "STRING",            # 完整点云PLY路径（带mask信息）
     )
     RETURN_NAMES = (
         "segmentation_stats",
         "segmented_ply_path",
         "segmented_glb_path", 
         "segmentation_report",
+        "full_pointcloud_with_mask_path",
     )
     OUTPUT_TOOLTIPS = [
         "分割统计信息（JSON格式，包含每个物体的点数统计）",
         "分割后的PLY点云文件路径",
         "分割后的GLB 3D模型文件路径",
-        "详细的分割处理报告（JSON格式）"
+        "详细的分割处理报告（JSON格式）",
+        "包含分割mask信息的完整原始点云PLY文件路径"
     ]
     OUTPUT_NODE = True
     FUNCTION = "process_mask_segmentation"
@@ -1187,7 +1506,10 @@ class VGGTMaskProcessorNode:
                                 target_object_id: int = 0,
                                 confidence_threshold: float = 0.5,
                                 export_format: str = "PLY",
-                                use_full_pointcloud: bool = True):
+                                use_full_pointcloud: bool = True,
+                                preserve_spatial_correspondence: bool = True,
+                                export_full_pointcloud_with_mask: bool = False,
+                                use_glb_quality_filtering: bool = True):
         """处理mask分割"""
         logger.info("开始VGGT Mask分割处理")
         logger.info(f"接收到tracks_json类型: {type(tracks_json)}, 长度: {len(tracks_json) if tracks_json else 0}")
@@ -1359,15 +1681,32 @@ class VGGTMaskProcessorNode:
             # 导出文件
             ply_path = ""
             glb_path = ""
+            full_pointcloud_path = ""
             
             if export_format in ["PLY", "BOTH"]:
                 if use_full_pointcloud:
                     # 使用完整点云分割（推荐）
                     logger.info("使用完整点云分割方法")
-                    ply_path = self._export_segmented_ply_new(
-                        native_full_result, mask_list, target_object_id, 
-                        output_dir, timestamp
-                    )
+                    if preserve_spatial_correspondence:
+                        # 新的空间保持方法
+                        logger.info("启用空间对应关系保持")
+                        if use_glb_quality_filtering:
+                            logger.info("使用GLB质量过滤")
+                            ply_path = self._export_segmented_ply_glb_quality(
+                                native_full_result, mask_list, target_object_id, 
+                                output_dir, timestamp
+                            )
+                        else:
+                            ply_path = self._export_segmented_ply_with_spatial_preservation(
+                                native_full_result, mask_list, target_object_id, 
+                                output_dir, timestamp
+                            )
+                    else:
+                        # 原来的方法
+                        ply_path = self._export_segmented_ply_new(
+                            native_full_result, mask_list, target_object_id, 
+                            output_dir, timestamp
+                        )
                 else:
                     # 仅使用tracks点分割（可能无效）
                     logger.info("使用tracks点分割方法（仅使用查询点）")
@@ -1378,6 +1717,14 @@ class VGGTMaskProcessorNode:
                         output_dir, timestamp
                     )
             
+            # 导出包含mask信息的完整点云
+            if export_full_pointcloud_with_mask:
+                logger.info("导出包含分割mask信息的完整点云")
+                full_pointcloud_path = self._export_full_pointcloud_with_mask(
+                    native_full_result, mask_list, target_object_id,
+                    output_dir, timestamp
+                )
+            
             if export_format in ["GLB", "BOTH"]:
                 glb_path = self._export_segmented_glb(
                     native_full_result, point_labels, target_object_id,
@@ -1386,12 +1733,13 @@ class VGGTMaskProcessorNode:
             
             # 生成报告
             report = self._generate_segmentation_report(
-                stats, ply_path, glb_path, target_object_id, confidence_threshold
+                stats, ply_path, glb_path, target_object_id, confidence_threshold,
+                full_pointcloud_path, preserve_spatial_correspondence, use_glb_quality_filtering
             )
             report_json = json.dumps(report, ensure_ascii=False, indent=2)
             
             logger.info("VGGT Mask分割处理完成")
-            return (stats_json, ply_path, glb_path, report_json)
+            return (stats_json, ply_path, glb_path, report_json, full_pointcloud_path)
             
         except Exception as e:
             logger.error(f"Mask分割处理失败: {e}")
@@ -1400,7 +1748,7 @@ class VGGTMaskProcessorNode:
             
             error_msg = f"分割处理失败: {str(e)}"
             error_json = json.dumps({"error": str(e)})
-            return (error_json, "", "", error_msg)
+            return (error_json, "", "", error_msg, "")
     
     def _generate_segmentation_stats(self, point_labels: Dict[int, List[int]]) -> Dict:
         """生成分割统计信息"""
@@ -1588,21 +1936,287 @@ class VGGTMaskProcessorNode:
             raise
     
     def _generate_segmentation_report(self, stats: Dict, ply_path: str, glb_path: str,
-                                    target_object_id: int, confidence_threshold: float) -> Dict:
+                                    target_object_id: int, confidence_threshold: float,
+                                    full_pointcloud_path: str, preserve_spatial_correspondence: bool,
+                                    use_glb_quality_filtering: bool) -> Dict:
         """生成详细的分割报告"""
         return {
             "processing_parameters": {
                 "target_object_id": target_object_id,
-                "confidence_threshold": confidence_threshold
+                "confidence_threshold": confidence_threshold,
+                "preserve_spatial_correspondence": preserve_spatial_correspondence,
+                "use_glb_quality_filtering": use_glb_quality_filtering
             },
             "segmentation_statistics": stats,
             "output_files": {
                 "ply_file": ply_path,
-                "glb_file": glb_path
+                "glb_file": glb_path,
+                "full_pointcloud_with_mask_path": full_pointcloud_path
             },
             "processing_time": time.time(),
-            "status": "success" if (ply_path or glb_path) else "failed"
+            "status": "success" if (ply_path or glb_path or full_pointcloud_path) else "failed"
         }
+
+    def _export_segmented_ply_with_spatial_preservation(self, raw_vggt_result: Dict, mask_sequence: List[np.ndarray], 
+                                                      target_object_id: int, output_dir: str, timestamp: int) -> str:
+        """导出保持空间对应关系的分割PLY文件"""
+        try:
+            # 使用空间保持方法获取分割结果
+            original_points, segmented_points, segment_mask, original_shape = create_segmented_pointcloud_with_spatial_preservation(
+                raw_vggt_result, mask_sequence, target_object_id if target_object_id > 0 else None
+            )
+            
+            if len(segmented_points) == 0:
+                logger.warning("分割后没有点，无法导出PLY文件")
+                return ""
+            
+            # 获取对应的颜色信息
+            colors = self._get_colors_for_segmented_points(raw_vggt_result, segment_mask, target_object_id)
+            
+            # 生成文件名
+            if target_object_id > 0:
+                filename = f"vggt_segmented_spatial_preserved_obj{target_object_id}_{timestamp}.ply"
+            else:
+                filename = f"vggt_segmented_spatial_preserved_all_{timestamp}.ply"
+            
+            ply_path = os.path.join(output_dir, filename)
+            self._write_ply_file(ply_path, segmented_points, colors)
+            
+            # 计算与原始点云的对应关系统计
+            total_original = len(original_points)
+            segmented_count = len(segmented_points)
+            preservation_ratio = segmented_count / total_original * 100 if total_original > 0 else 0
+            
+            logger.info(f"空间保持分割PLY已保存: {ply_path}")
+            logger.info(f"  原始点云: {total_original} 个点")
+            logger.info(f"  分割点云: {segmented_count} 个点 ({preservation_ratio:.1f}%)")
+            logger.info(f"  坐标系: 与原始点云完全一致")
+            logger.info(f"  原始形状: {original_shape}")
+            
+            return ply_path
+            
+        except Exception as e:
+            logger.error(f"导出空间保持分割PLY失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return ""
+    
+    def _export_full_pointcloud_with_mask(self, raw_vggt_result: Dict, mask_sequence: List[np.ndarray], 
+                                        target_object_id: int, output_dir: str, timestamp: int) -> str:
+        """导出包含分割mask信息的完整点云文件"""
+        try:
+            # 获取完整的空间对应信息
+            original_points, segmented_points, segment_mask, original_shape = create_segmented_pointcloud_with_spatial_preservation(
+                raw_vggt_result, mask_sequence, target_object_id if target_object_id > 0 else None
+            )
+            
+            if len(original_points) == 0:
+                logger.warning("没有原始点云数据，无法导出完整点云文件")
+                return ""
+            
+            # 获取完整点云的颜色信息
+            colors = self._get_full_pointcloud_colors(raw_vggt_result, len(original_points))
+            
+            # 为每个点添加分割信息（通过颜色标记）
+            # 物体点使用特殊颜色，背景点保持原色或使用灰色
+            marked_colors = colors.copy() if colors is not None else np.ones((len(original_points), 3), dtype=np.uint8) * 128
+            
+            # 为分割出的物体点着色
+            if target_object_id > 0:
+                # 特定物体用特殊颜色标记
+                object_color = self._get_object_color(target_object_id)
+                marked_colors[segment_mask] = object_color
+            else:
+                # 所有非背景物体用红色标记
+                marked_colors[segment_mask] = [255, 0, 0]
+            
+            # 生成文件名
+            if target_object_id > 0:
+                filename = f"vggt_full_pointcloud_with_mask_obj{target_object_id}_{timestamp}.ply"
+            else:
+                filename = f"vggt_full_pointcloud_with_mask_all_{timestamp}.ply"
+            
+            ply_path = os.path.join(output_dir, filename)
+            
+            # 写入PLY文件，包含额外的mask信息
+            self._write_ply_file_with_mask_info(ply_path, original_points, marked_colors, segment_mask, original_shape)
+            
+            object_count = np.sum(segment_mask)
+            total_count = len(original_points)
+            object_ratio = object_count / total_count * 100 if total_count > 0 else 0
+            
+            logger.info(f"完整点云（带mask）已保存: {ply_path}")
+            logger.info(f"  总点数: {total_count}")
+            logger.info(f"  物体点数: {object_count} ({object_ratio:.1f}%)")
+            logger.info(f"  背景点数: {total_count - object_count} ({100-object_ratio:.1f}%)")
+            logger.info(f"  原始形状: {original_shape}")
+            
+            return ply_path
+            
+        except Exception as e:
+            logger.error(f"导出完整点云（带mask）失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return ""
+    
+    def _get_colors_for_segmented_points(self, raw_vggt_result: Dict, segment_mask: np.ndarray, target_object_id: int) -> np.ndarray:
+        """获取分割点的颜色信息"""
+        try:
+            if 'images' in raw_vggt_result:
+                images = raw_vggt_result['images']
+                if isinstance(images, torch.Tensor):
+                    images_np = images.cpu().numpy()
+                else:
+                    images_np = images
+                
+                if images_np.ndim == 5 and images_np.shape[0] == 1:
+                    images_np = np.squeeze(images_np, axis=0)
+                
+                if images_np.ndim == 4:
+                    if images_np.shape[1] == 3:  # (S, 3, H, W) -> (S, H, W, 3)
+                        images_np = np.transpose(images_np, (0, 2, 3, 1))
+                    
+                    # 展平颜色数据
+                    colors_flat = images_np.reshape(-1, 3)
+                    if colors_flat.max() <= 1.0:
+                        colors_flat = (colors_flat * 255).astype(np.uint8)
+                    else:
+                        colors_flat = colors_flat.astype(np.uint8)
+                    
+                    # 应用分割mask
+                    if len(colors_flat) >= len(segment_mask):
+                        return colors_flat[segment_mask]
+        except Exception as e:
+            logger.warning(f"获取分割点颜色失败: {e}")
+        
+        # 使用默认颜色
+        segmented_count = np.sum(segment_mask)
+        if target_object_id > 0:
+            color = self._get_object_color(target_object_id)
+            return np.tile(color, (segmented_count, 1)).astype(np.uint8)
+        else:
+            return np.ones((segmented_count, 3), dtype=np.uint8) * 128
+    
+    def _get_full_pointcloud_colors(self, raw_vggt_result: Dict, point_count: int) -> np.ndarray:
+        """获取完整点云的颜色信息"""
+        try:
+            if 'images' in raw_vggt_result:
+                images = raw_vggt_result['images']
+                if isinstance(images, torch.Tensor):
+                    images_np = images.cpu().numpy()
+                else:
+                    images_np = images
+                
+                if images_np.ndim == 5 and images_np.shape[0] == 1:
+                    images_np = np.squeeze(images_np, axis=0)
+                
+                if images_np.ndim == 4:
+                    if images_np.shape[1] == 3:  # (S, 3, H, W) -> (S, H, W, 3)
+                        images_np = np.transpose(images_np, (0, 2, 3, 1))
+                    
+                    # 展平颜色数据
+                    colors_flat = images_np.reshape(-1, 3)
+                    if colors_flat.max() <= 1.0:
+                        colors_flat = (colors_flat * 255).astype(np.uint8)
+                    else:
+                        colors_flat = colors_flat.astype(np.uint8)
+                    
+                    # 确保长度匹配
+                    if len(colors_flat) >= point_count:
+                        return colors_flat[:point_count]
+        except Exception as e:
+            logger.warning(f"获取完整点云颜色失败: {e}")
+        
+        # 使用默认灰色
+        return np.ones((point_count, 3), dtype=np.uint8) * 128
+    
+    def _get_object_color(self, object_id: int) -> np.ndarray:
+        """为特定物体ID获取颜色"""
+        colors = [
+            [255, 0, 0],    # 红色
+            [0, 255, 0],    # 绿色  
+            [0, 0, 255],    # 蓝色
+            [255, 255, 0],  # 黄色
+            [255, 0, 255],  # 洋红
+            [0, 255, 255],  # 青色
+            [255, 128, 0],  # 橙色
+            [128, 0, 255],  # 紫色
+        ]
+        return np.array(colors[object_id % len(colors)], dtype=np.uint8)
+    
+    def _write_ply_file_with_mask_info(self, filepath: str, vertices: np.ndarray, colors: np.ndarray, 
+                                     segment_mask: np.ndarray, original_shape: tuple):
+        """写入包含mask信息的PLY文件"""
+        try:
+            with open(filepath, 'w') as f:
+                # PLY头部
+                f.write("ply\n")
+                f.write("format ascii 1.0\n")
+                f.write(f"comment VGGT segmented pointcloud with spatial preservation\n")
+                f.write(f"comment Original shape: {original_shape}\n")
+                f.write(f"comment Object points: {np.sum(segment_mask)}\n")
+                f.write(f"comment Background points: {len(segment_mask) - np.sum(segment_mask)}\n")
+                f.write(f"element vertex {len(vertices)}\n")
+                f.write("property float x\n")
+                f.write("property float y\n")
+                f.write("property float z\n")
+                f.write("property uchar red\n")
+                f.write("property uchar green\n")
+                f.write("property uchar blue\n")
+                f.write("property uchar is_object\n")  # 额外属性：是否为物体点
+                f.write("end_header\n")
+                
+                # 写入顶点数据
+                for i in range(len(vertices)):
+                    x, y, z = vertices[i]
+                    r, g, b = colors[i]
+                    is_obj = 255 if segment_mask[i] else 0  # 物体点为255，背景点为0
+                    f.write(f"{x:.6f} {y:.6f} {z:.6f} {r} {g} {b} {is_obj}\n")
+                        
+        except Exception as e:
+            logger.error(f"写入PLY文件（带mask信息）失败: {e}")
+            raise
+
+    def _export_segmented_ply_glb_quality(self, raw_vggt_result: Dict, mask_sequence: List[np.ndarray], 
+                                         target_object_id: int, output_dir: str, timestamp: int) -> str:
+        """导出GLB质量的分割PLY文件"""
+        try:
+            # 使用GLB质量分割方法
+            vertices, colors = create_segmented_pointcloud_glb_quality(
+                raw_vggt_result, mask_sequence, target_object_id if target_object_id > 0 else None
+            )
+            
+            if len(vertices) == 0:
+                logger.warning("GLB质量分割后没有点，回退到标准方法")
+                return self._export_segmented_ply_with_spatial_preservation(
+                    raw_vggt_result, mask_sequence, target_object_id, output_dir, timestamp
+                )
+            
+            # 生成文件名
+            if target_object_id > 0:
+                filename = f"vggt_segmented_glb_quality_obj{target_object_id}_{timestamp}.ply"
+            else:
+                filename = f"vggt_segmented_glb_quality_all_{timestamp}.ply"
+            
+            ply_path = os.path.join(output_dir, filename)
+            self._write_ply_file(ply_path, vertices, colors)
+            
+            logger.info(f"GLB质量分割PLY已保存: {ply_path}")
+            logger.info(f"  点数: {len(vertices)}")
+            logger.info(f"  质量: 与GLB模型输出一致")
+            logger.info(f"  过滤: 使用了VGGT官方过滤算法")
+            
+            return ply_path
+            
+        except Exception as e:
+            logger.error(f"导出GLB质量分割PLY失败: {e}")
+            import traceback
+            traceback.print_exc()
+            # 回退到标准方法
+            logger.info("回退到标准空间保持方法")
+            return self._export_segmented_ply_with_spatial_preservation(
+                raw_vggt_result, mask_sequence, target_object_id, output_dir, timestamp
+            )
 
 # -----------------------------------------------------------------------------
 # 节点注册

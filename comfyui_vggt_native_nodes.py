@@ -444,7 +444,7 @@ class VGGTNativeFullOutputNode:
             )
             
             # 生成原生点云PLY文件
-            pointcloud_ply_path = self._export_native_pointcloud(raw_results, confidence_threshold)
+            pointcloud_ply_path = self._export_native_pointcloud(raw_results, confidence_threshold, mask_black_bg, mask_white_bg, mask_sky)
             
             logger.info("VGGT原生完整输出完成")
             return (raw_results, summary_json, tracks_json, intrinsics_json, poses_json, 
@@ -694,8 +694,13 @@ class VGGTNativeFullOutputNode:
             logger.error(f"生成3D模型失败: {e}")
             return ""
     
-    def _export_native_pointcloud(self, raw_results: Dict, confidence_threshold: float) -> str:
-        """导出原生格式的点云PLY文件"""
+    def _export_native_pointcloud(self, raw_results: Dict, confidence_threshold: float,
+                                mask_black_bg: bool = False, mask_white_bg: bool = False, mask_sky: bool = False) -> str:
+        """导出与GLB完全一致的点云PLY文件"""
+        if not VGGT_UTILS_AVAILABLE or not predictions_to_glb:
+            logger.warning("VGGT工具函数不可用，使用简化版本导出PLY")
+            return self._export_simple_pointcloud(raw_results, confidence_threshold)
+        
         try:
             # 创建输出目录
             if FOLDER_PATHS_AVAILABLE:
@@ -707,18 +712,178 @@ class VGGTNativeFullOutputNode:
             # 生成文件名
             import time
             timestamp = int(time.time())
-            ply_path = os.path.join(output_dir, f"vggt_native_{timestamp}.ply")
+            ply_path = os.path.join(output_dir, f"vggt_native_consistent_{timestamp}.ply")
+            
+            logger.info(f"开始生成与GLB一致的点云PLY: {ply_path}")
+            
+            # 使用与GLB完全相同的数据准备逻辑
+            world_points_from_depth = raw_results.get('points_from_depth')
+            
+            # depth_conf: 兼容多种返回格式
+            depth_conf = None
+            if 'depth' in raw_results:
+                if isinstance(raw_results['depth'], dict):
+                    depth_conf = raw_results['depth'].get('confidence')
+                else:
+                    depth_conf = raw_results.get('depth_conf')
+            
+            # images
+            images_tensor = raw_results.get('images')
+            
+            # extrinsic
+            extrinsic_mat = None
+            if 'cameras' in raw_results:
+                if isinstance(raw_results['cameras'], dict):
+                    extrinsic_mat = raw_results['cameras'].get('extrinsic')
+                else:
+                    extrinsic_mat = raw_results.get('extrinsic')
+            
+            # 特别处理 extrinsic: 去掉 batch 维 (1, S, 3, 4) -> (S, 3, 4)
+            if isinstance(extrinsic_mat, torch.Tensor):
+                if extrinsic_mat.ndim == 4 and extrinsic_mat.shape[0] == 1:
+                    extrinsic_mat = extrinsic_mat.squeeze(0)
+            elif isinstance(extrinsic_mat, np.ndarray):
+                if extrinsic_mat.ndim == 4 and extrinsic_mat.shape[0] == 1:
+                    extrinsic_mat = np.squeeze(extrinsic_mat, axis=0)
+            
+            # 维度兼容处理
+            images_tensor_proc = images_tensor
+            if isinstance(images_tensor_proc, torch.Tensor):
+                if images_tensor_proc.ndim == 5 and images_tensor_proc.shape[0] == 1:
+                    images_tensor_proc = images_tensor_proc.squeeze(0)
+            elif isinstance(images_tensor_proc, np.ndarray):
+                if images_tensor_proc.ndim == 5 and images_tensor_proc.shape[0] == 1:
+                    images_tensor_proc = np.squeeze(images_tensor_proc, axis=0)
+            
+            wpfd_proc = world_points_from_depth
+            if isinstance(wpfd_proc, torch.Tensor):
+                if wpfd_proc is not None and wpfd_proc.ndim == 5 and wpfd_proc.shape[0] == 1:
+                    wpfd_proc = wpfd_proc.squeeze(0)
+            elif isinstance(wpfd_proc, np.ndarray):
+                if wpfd_proc is not None and wpfd_proc.ndim == 5 and wpfd_proc.shape[0] == 1:
+                    wpfd_proc = np.squeeze(wpfd_proc, axis=0)
+            
+            predictions_formatted = {
+                'world_points_from_depth': wpfd_proc,
+                'depth_conf': depth_conf,
+                'images': images_tensor_proc,
+                'extrinsic': extrinsic_mat,
+            }
+            
+            # 如果没有depth-based points，尝试使用原始点云
+            if predictions_formatted['world_points_from_depth'] is None:
+                if 'points' in raw_results:
+                    logger.info("Using point_map as fallback for world_points")
+                    if isinstance(raw_results['points'], dict):
+                        predictions_formatted['world_points'] = raw_results['points']['point_map']
+                        predictions_formatted['world_points_conf'] = raw_results['points']['confidence']
+                    else:
+                        predictions_formatted['world_points'] = raw_results['points']
+            
+            # 确保数据格式正确（转换为numpy）
+            for key, value in predictions_formatted.items():
+                if value is not None and isinstance(value, torch.Tensor):
+                    predictions_formatted[key] = value.cpu().numpy()
+            
+            # 使用官方VGGT的predictions_to_glb函数生成3D场景（但不显示相机）
+            logger.info("使用predictions_to_glb函数进行与GLB一致的点云过滤")
+            scene_3d = predictions_to_glb(
+                predictions_formatted,
+                conf_thres=confidence_threshold,
+                filter_by_frames="all",
+                mask_black_bg=mask_black_bg,
+                mask_white_bg=mask_white_bg,
+                show_cam=False,  # 不显示相机，只要点云
+                mask_sky=mask_sky,
+                target_dir=None,
+                prediction_mode="Depthmap and Camera Branch"
+            )
+            
+            # 从3D场景中提取点云数据
+            vertices_list = []
+            colors_list = []
+            
+            # 遍历场景中的所有几何体
+            for geometry in scene_3d.geometry.values():
+                if hasattr(geometry, 'vertices') and hasattr(geometry, 'visual'):
+                    # 提取顶点坐标
+                    vertices = np.array(geometry.vertices)
+                    vertices_list.append(vertices)
+                    
+                    # 提取颜色信息
+                    if hasattr(geometry.visual, 'vertex_colors'):
+                        colors = np.array(geometry.visual.vertex_colors)[:, :3]  # 只取RGB，忽略Alpha
+                        colors_list.append(colors)
+                    elif hasattr(geometry.visual, 'face_colors'):
+                        # 如果只有面颜色，用面颜色近似顶点颜色
+                        face_colors = np.array(geometry.visual.face_colors)[:, :3]
+                        # 简单方法：为每个顶点分配第一个面的颜色
+                        vertex_colors = np.tile(face_colors[0] if len(face_colors) > 0 else [128, 128, 128], 
+                                              (len(vertices), 1))
+                        colors_list.append(vertex_colors)
+                    else:
+                        # 没有颜色信息，使用默认灰色
+                        default_colors = np.ones((len(vertices), 3), dtype=np.uint8) * 128
+                        colors_list.append(default_colors)
+            
+            # 合并所有点云数据
+            if vertices_list:
+                all_vertices = np.vstack(vertices_list)
+                all_colors = np.vstack(colors_list)
+                
+                # 确保颜色格式正确
+                if all_colors.max() <= 1.0:
+                    all_colors = (all_colors * 255).astype(np.uint8)
+                else:
+                    all_colors = all_colors.astype(np.uint8)
+                
+                # 写入PLY文件
+                self._write_ply_file(ply_path, all_vertices, all_colors)
+                
+                logger.info(f"与GLB一致的点云PLY已保存到: {ply_path} ({len(all_vertices)} 个点)")
+                logger.info(f"  使用了与GLB相同的过滤条件:")
+                logger.info(f"    - 置信度阈值: {confidence_threshold}")
+                logger.info(f"    - 过滤黑色背景: {mask_black_bg}")
+                logger.info(f"    - 过滤白色背景: {mask_white_bg}")
+                logger.info(f"    - 过滤天空: {mask_sky}")
+                return ply_path
+            else:
+                logger.warning("没有从3D场景中提取到点云数据")
+                return ""
+            
+        except Exception as e:
+            logger.error(f"导出一致性点云PLY失败: {e}")
+            import traceback
+            traceback.print_exc()
+            # 回退到简化版本
+            logger.info("回退到简化版本PLY导出")
+            return self._export_simple_pointcloud(raw_results, confidence_threshold)
+    
+    def _export_simple_pointcloud(self, raw_results: Dict, confidence_threshold: float) -> str:
+        """简化版本的点云导出（当predictions_to_glb不可用时）"""
+        try:
+            # 创建输出目录
+            if FOLDER_PATHS_AVAILABLE:
+                output_dir = os.path.join(folder_paths.get_output_directory(), "pointclouds")
+            else:
+                output_dir = os.path.join("output", "pointclouds")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 生成文件名
+            import time
+            timestamp = int(time.time())
+            ply_path = os.path.join(output_dir, f"vggt_native_simple_{timestamp}.ply")
             
             # 从原生结果提取点云数据
             if 'points_from_depth' in raw_results:
                 points = raw_results['points_from_depth']
-                logger.info("使用 points_from_depth 生成PLY")
+                logger.info("使用 points_from_depth 生成简化PLY")
             elif 'points' in raw_results:
                 if isinstance(raw_results['points'], dict):
                     points = raw_results['points']['point_map']
                 else:
                     points = raw_results['points']
-                logger.info("使用 points 生成PLY")
+                logger.info("使用 points 生成简化PLY")
             else:
                 logger.warning("No point cloud data found in raw results")
                 return ""
@@ -789,11 +954,11 @@ class VGGTNativeFullOutputNode:
             # 写入PLY文件
             self._write_ply_file(ply_path, points_np, colors_rgb)
             
-            logger.info(f"原生点云PLY已保存到: {ply_path} ({len(points_np)} 个点)")
+            logger.info(f"简化点云PLY已保存到: {ply_path} ({len(points_np)} 个点)")
             return ply_path
             
         except Exception as e:
-            logger.error(f"导出点云PLY失败: {e}")
+            logger.error(f"导出简化点云PLY失败: {e}")
             raise
     
     def _write_ply_file(self, filepath: str, vertices: np.ndarray, colors: np.ndarray = None):
