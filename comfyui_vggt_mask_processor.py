@@ -41,14 +41,46 @@ except ImportError:
 logger = logging.getLogger('vvl_vggt_mask_processor')
 
 # -----------------------------------------------------------------------------
-# 核心交集算法
+# 核心投影算法
 # -----------------------------------------------------------------------------
 
-def compute_pointcloud_mask_intersection(filtered_vggt_result: Dict, mask_sequence: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """计算过滤后点云与mask白色区域的交集"""
-    logger.info("🎯 开始计算点云与mask的交集")
+def project_3d_to_2d(points_3d: np.ndarray, intrinsic: np.ndarray, extrinsic: np.ndarray) -> np.ndarray:
+    """
+    将3D点投影到2D像素坐标
     
-    # 1. 获取过滤后的点云数据
+    Args:
+        points_3d: (N, 3) 世界坐标系下的3D点
+        intrinsic: (3, 3) 相机内参矩阵
+        extrinsic: (3, 4) 相机外参矩阵 [R|t]
+    
+    Returns:
+        pixels_2d: (N, 2) 像素坐标 (u, v)
+    """
+    # 转换为齐次坐标
+    points_3d_homo = np.hstack([points_3d, np.ones((points_3d.shape[0], 1))])  # (N, 4)
+    
+    # 世界坐标 → 相机坐标
+    camera_coords = (extrinsic @ points_3d_homo.T).T  # (N, 3)
+    
+    # 过滤掉相机后方的点（z <= 0）
+    valid_depth = camera_coords[:, 2] > 0
+    
+    # 相机坐标 → 像素坐标
+    pixels_homo = (intrinsic @ camera_coords.T).T  # (N, 3)
+    
+    # 归一化得到像素坐标
+    pixels_2d = pixels_homo[:, :2] / pixels_homo[:, 2:3]  # (N, 2)
+    
+    return pixels_2d, valid_depth
+
+def compute_3d_projection_mask_intersection(filtered_vggt_result: Dict, mask_sequence: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    使用3D投影方法计算点云与mask白色区域的交集
+    核心思想：3D点坐标 + 相机参数 → 2D像素坐标 (u,v) → 判断点是否在白色区域
+    """
+    logger.info("🎯 开始基于3D投影的点云与mask交集计算")
+    
+    # 1. 提取3D点云数据
     points_data = filtered_vggt_result.get('points_from_depth')
     if points_data is None:
         points_data = filtered_vggt_result.get('points')
@@ -69,19 +101,43 @@ def compute_pointcloud_mask_intersection(filtered_vggt_result: Dict, mask_sequen
         points_np = np.squeeze(points_np, axis=0)
     
     original_shape = points_np.shape
-    logger.info(f"过滤后点云形状: {original_shape}")
+    logger.info(f"3D点云形状: {original_shape}")
     
-    # 2. 验证点云格式并重塑
+    # 2. 验证点云格式
     if len(original_shape) != 4:  # 必须是 (S, H, W, 3)
         raise ValueError(f"点云形状必须是(S, H, W, 3)，但得到: {original_shape}")
     
     S, H, W, _ = original_shape
-    points_flat = points_np.reshape(-1, 3)  # (S*H*W, 3)
     
-    # 3. 获取对应的图像颜色
+    # 3. 提取相机参数
+    cameras_data = filtered_vggt_result.get('cameras')
+    if cameras_data is None:
+        raise ValueError("过滤后的VGGT结果中没有相机参数")
+    
+    intrinsic = cameras_data.get('intrinsic')
+    extrinsic = cameras_data.get('extrinsic')
+    
+    if intrinsic is None or extrinsic is None:
+        raise ValueError("相机内参或外参缺失")
+    
+    # 转换为numpy
+    if isinstance(intrinsic, torch.Tensor):
+        intrinsic = intrinsic.cpu().numpy()
+    if isinstance(extrinsic, torch.Tensor):
+        extrinsic = extrinsic.cpu().numpy()
+    
+    # 处理维度
+    if intrinsic.ndim == 4 and intrinsic.shape[0] == 1:
+        intrinsic = np.squeeze(intrinsic, axis=0)  # (S, 3, 3)
+    if extrinsic.ndim == 4 and extrinsic.shape[0] == 1:
+        extrinsic = np.squeeze(extrinsic, axis=0)    # (S, 3, 4)
+    
+    logger.info(f"相机内参形状: {intrinsic.shape}, 外参形状: {extrinsic.shape}")
+    
+    # 4. 获取对应的图像颜色
     colors_flat = extract_colors_from_filtered_result(filtered_vggt_result, original_shape)
     
-    # 4. 处理mask序列
+    # 5. 处理mask序列
     logger.info(f"处理mask序列: {len(mask_sequence)} 张")
     
     # 检查mask分辨率
@@ -89,69 +145,371 @@ def compute_pointcloud_mask_intersection(filtered_vggt_result: Dict, mask_sequen
     mask_h, mask_w = first_mask.shape
     logger.info(f"Mask分辨率: {mask_w}x{mask_h}, 点云分辨率: {W}x{H}")
     
-    # 如果分辨率不匹配，缩放mask
-    if W != mask_w or H != mask_h:
-        logger.info(f"缩放mask从{mask_w}x{mask_h}到{W}x{H}")
-        resized_masks = []
-        for mask in mask_sequence:
-            resized_mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
-            resized_masks.append(resized_mask)
-        mask_sequence = resized_masks
+    # 🎯 严格的白色区域阈值：只保留纯白色区域
+    mask_threshold = determine_strict_white_threshold(mask_sequence)
+    logger.info(f"使用严格白色区域阈值: {mask_threshold}")
     
-    # 5. 确定mask阈值（白色区域）
-    mask_threshold = determine_white_threshold(mask_sequence)
-    logger.info(f"使用白色区域阈值: {mask_threshold}")
+    # 6. 逐帧进行3D投影和交集计算
+    intersection_points = []
+    intersection_colors = []
+    intersection_indices = []
     
-    # 6. 计算交集mask
-    intersection_mask = np.zeros(len(points_flat), dtype=bool)
-    
-    n_frames = min(S, len(mask_sequence))
-    logger.info(f"处理 {n_frames} 帧进行交集计算")
+    n_frames = min(S, len(mask_sequence), intrinsic.shape[0], extrinsic.shape[0])
+    logger.info(f"处理 {n_frames} 帧进行3D投影交集计算")
     
     for frame_idx in range(n_frames):
-        frame_mask = mask_sequence[frame_idx]  # (H, W)
+        # 获取当前帧的数据
+        frame_points = points_np[frame_idx].reshape(-1, 3)  # (H*W, 3)
+        frame_mask = mask_sequence[frame_idx]  # (mask_h, mask_w)
+        frame_intrinsic = intrinsic[frame_idx] if intrinsic.ndim == 3 else intrinsic  # (3, 3)
+        frame_extrinsic = extrinsic[frame_idx] if extrinsic.ndim == 3 else extrinsic  # (3, 4)
         
-        # 计算当前帧在扁平化数组中的索引范围
-        frame_start = frame_idx * H * W
-        frame_end = frame_start + H * W
+        # 🎯 严格过滤有效的3D点：排除异常值
+        valid_3d_mask = apply_strict_3d_filtering(frame_points)
+        valid_3d_points = frame_points[valid_3d_mask]
         
-        # 展平mask
-        mask_flat = frame_mask.flatten()  # (H*W,)
+        if len(valid_3d_points) == 0:
+            logger.info(f"  帧{frame_idx}: 无有效3D点")
+            continue
         
-        # 找到白色区域
-        white_pixels = mask_flat > mask_threshold
-        
-        # 过滤掉已经被VGGT过滤掉的点（值为0的点）
-        frame_points = points_flat[frame_start:frame_end]
-        valid_points = np.linalg.norm(frame_points, axis=1) > 1e-6  # 非零点
-        
-        # 交集：既在白色区域又是有效点
-        frame_intersection = white_pixels & valid_points
-        
-        # 更新总交集mask
-        intersection_mask[frame_start:frame_end] = frame_intersection
-        
-        frame_intersection_count = np.sum(frame_intersection)
-        frame_white_count = np.sum(white_pixels)
-        frame_valid_count = np.sum(valid_points)
-        
-        if frame_idx < 3:  # 显示前3帧的统计
-            logger.info(f"  帧{frame_idx}: 白色像素={frame_white_count}, 有效点={frame_valid_count}, 交集={frame_intersection_count}")
+        # 3D点投影到2D像素坐标
+        try:
+            pixels_2d, depth_valid = project_3d_to_2d_precise(valid_3d_points, frame_intrinsic, frame_extrinsic)
+            
+            # 同时满足深度有效的点
+            depth_valid_points = valid_3d_points[depth_valid]
+            depth_valid_pixels = pixels_2d[depth_valid]
+            
+            if len(depth_valid_points) == 0:
+                logger.info(f"  帧{frame_idx}: 无深度有效点")
+                continue
+            
+            # 🎯 精确的像素坐标变换和边界检查
+            u_coords, v_coords = transform_coords_precisely(depth_valid_pixels, W, H, mask_w, mask_h)
+            
+            # 🎯 严格的边界检查：增加安全边距
+            margin = 2  # 像素边距
+            in_bounds = ((u_coords >= margin) & (u_coords < mask_w - margin) & 
+                        (v_coords >= margin) & (v_coords < mask_h - margin))
+            
+            bounded_points = depth_valid_points[in_bounds]
+            bounded_u = u_coords[in_bounds]
+            bounded_v = v_coords[in_bounds]
+            
+            if len(bounded_points) == 0:
+                logger.info(f"  帧{frame_idx}: 无边界内点")
+                continue
+            
+            # 🎯 多重采样检查：检查像素及其邻域
+            white_region_mask = check_white_region_with_neighborhood(
+                frame_mask, bounded_u, bounded_v, mask_threshold
+            )
+            
+            # 提取在白色区域的3D点
+            white_region_points = bounded_points[white_region_mask]
+            
+            if len(white_region_points) > 0:
+                # 🎯 空间一致性过滤：移除离群点
+                filtered_points = apply_spatial_consistency_filter(white_region_points)
+                
+                if len(filtered_points) > 0:
+                    intersection_points.append(filtered_points)
+                    
+                    # 提取对应的颜色（需要重新计算索引）
+                    frame_start = frame_idx * H * W
+                    valid_indices = np.where(valid_3d_mask)[0]
+                    depth_valid_indices = valid_indices[depth_valid]
+                    bounded_indices = depth_valid_indices[in_bounds]
+                    white_indices = bounded_indices[white_region_mask]
+                    
+                    # 对于过滤后的点，需要找到对应的索引
+                    if len(filtered_points) < len(white_region_points):
+                        # 找到过滤后点在原白色区域点中的索引
+                        kept_indices = find_kept_point_indices(white_region_points, filtered_points)
+                        white_indices = white_indices[kept_indices]
+                    
+                    absolute_indices = frame_start + white_indices
+                    frame_colors = colors_flat[absolute_indices]
+                    intersection_colors.append(frame_colors)
+                    intersection_indices.extend(absolute_indices)
+            
+            frame_intersection_count = len(filtered_points) if 'filtered_points' in locals() and len(filtered_points) > 0 else 0
+            valid_count = len(valid_3d_points)
+            projected_count = len(depth_valid_points)
+            bounded_count = len(bounded_points)
+            raw_white_count = len(white_region_points) if len(white_region_points) > 0 else 0
+            
+            if frame_idx < 3:  # 显示前3帧的统计
+                logger.info(f"  帧{frame_idx}: 有效3D点={valid_count}, 投影成功={projected_count}, 边界内={bounded_count}, 原始白色={raw_white_count}, 过滤后={frame_intersection_count}")
+                
+        except Exception as e:
+            logger.warning(f"  帧{frame_idx}: 投影失败 - {e}")
+            continue
     
-    # 7. 提取交集结果
-    intersected_points = points_flat[intersection_mask]
-    intersected_colors = colors_flat[intersection_mask]
+    # 7. 合并所有帧的交集结果
+    if intersection_points:
+        final_intersected_points = np.vstack(intersection_points)
+        final_intersected_colors = np.vstack(intersection_colors)
+    else:
+        final_intersected_points = np.array([]).reshape(0, 3)
+        final_intersected_colors = np.array([]).reshape(0, 3)
     
-    total_intersection = np.sum(intersection_mask)
-    total_points = len(points_flat)
+    # 8. 🎯 全局空间过滤：移除全局离群点
+    if len(final_intersected_points) > 0:
+        final_intersected_points, final_intersected_colors = apply_global_outlier_removal(
+            final_intersected_points, final_intersected_colors
+        )
+    
+    # 创建完整的intersection_mask
+    total_points = np.prod(original_shape[:3])  # S * H * W
+    intersection_mask = np.zeros(total_points, dtype=bool)
+    if intersection_indices and len(final_intersected_points) > 0:
+        # 重新计算索引（如果有全局过滤）
+        valid_intersection_indices = intersection_indices[:len(final_intersected_points)]
+        intersection_mask[valid_intersection_indices] = True
+    
+    total_intersection = len(final_intersected_points)
     intersection_ratio = total_intersection / total_points * 100 if total_points > 0 else 0
     
-    logger.info(f"🎯 交集计算完成:")
+    logger.info(f"🎯 基于3D投影的严格交集计算完成:")
     logger.info(f"  原始过滤点云: {total_points} 个点")
     logger.info(f"  交集结果: {total_intersection} 个点 ({intersection_ratio:.1f}%)")
-    logger.info(f"  方法: 过滤后点云 ∩ mask白色区域")
+    logger.info(f"  方法: 3D点坐标 + 相机参数 → 2D像素坐标 → 严格mask白色区域判断")
     
-    return intersected_points, intersected_colors, intersection_mask
+    return final_intersected_points, final_intersected_colors, intersection_mask
+
+def compute_3d_projection_mask_intersection_configurable(filtered_vggt_result: Dict, mask_sequence: List[np.ndarray],
+                                                       strict_filtering: bool = True,
+                                                       pixel_margin: int = 2,
+                                                       outlier_factor: float = 1.5) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    可配置的3D投影方法计算点云与mask白色区域的交集
+    """
+    logger.info(f"🎯 开始可配置的3D投影交集计算 (严格过滤: {strict_filtering})")
+    
+    # 1. 提取3D点云数据
+    points_data = filtered_vggt_result.get('points_from_depth')
+    if points_data is None:
+        points_data = filtered_vggt_result.get('points')
+    if points_data is None:
+        raise ValueError("过滤后的VGGT结果中没有点云数据")
+    
+    if isinstance(points_data, dict):
+        points_data = points_data.get('point_map', points_data)
+    
+    # 转换为numpy
+    if isinstance(points_data, torch.Tensor):
+        points_np = points_data.cpu().numpy()
+    else:
+        points_np = points_data
+    
+    # 去掉batch维度
+    if points_np.ndim == 5 and points_np.shape[0] == 1:
+        points_np = np.squeeze(points_np, axis=0)
+    
+    original_shape = points_np.shape
+    logger.info(f"3D点云形状: {original_shape}")
+    
+    # 2. 验证点云格式
+    if len(original_shape) != 4:  # 必须是 (S, H, W, 3)
+        raise ValueError(f"点云形状必须是(S, H, W, 3)，但得到: {original_shape}")
+    
+    S, H, W, _ = original_shape
+    
+    # 3. 提取相机参数
+    cameras_data = filtered_vggt_result.get('cameras')
+    if cameras_data is None:
+        raise ValueError("过滤后的VGGT结果中没有相机参数")
+    
+    intrinsic = cameras_data.get('intrinsic')
+    extrinsic = cameras_data.get('extrinsic')
+    
+    if intrinsic is None or extrinsic is None:
+        raise ValueError("相机内参或外参缺失")
+    
+    # 转换为numpy
+    if isinstance(intrinsic, torch.Tensor):
+        intrinsic = intrinsic.cpu().numpy()
+    if isinstance(extrinsic, torch.Tensor):
+        extrinsic = extrinsic.cpu().numpy()
+    
+    # 处理维度
+    if intrinsic.ndim == 4 and intrinsic.shape[0] == 1:
+        intrinsic = np.squeeze(intrinsic, axis=0)  # (S, 3, 3)
+    if extrinsic.ndim == 4 and extrinsic.shape[0] == 1:
+        extrinsic = np.squeeze(extrinsic, axis=0)    # (S, 3, 4)
+    
+    logger.info(f"相机内参形状: {intrinsic.shape}, 外参形状: {extrinsic.shape}")
+    
+    # 4. 获取对应的图像颜色
+    colors_flat = extract_colors_from_filtered_result(filtered_vggt_result, original_shape)
+    
+    # 5. 处理mask序列
+    logger.info(f"处理mask序列: {len(mask_sequence)} 张")
+    
+    # 检查mask分辨率
+    first_mask = mask_sequence[0]
+    mask_h, mask_w = first_mask.shape
+    logger.info(f"Mask分辨率: {mask_w}x{mask_h}, 点云分辨率: {W}x{H}")
+    
+    # 选择阈值计算方法
+    if strict_filtering:
+        mask_threshold = determine_strict_white_threshold(mask_sequence)
+        logger.info(f"使用严格白色区域阈值: {mask_threshold}")
+    else:
+        mask_threshold = determine_white_threshold(mask_sequence)
+        logger.info(f"使用标准白色区域阈值: {mask_threshold}")
+    
+    # 6. 逐帧进行3D投影和交集计算
+    intersection_points = []
+    intersection_colors = []
+    intersection_indices = []
+    
+    n_frames = min(S, len(mask_sequence), intrinsic.shape[0], extrinsic.shape[0])
+    logger.info(f"处理 {n_frames} 帧进行3D投影交集计算")
+    
+    for frame_idx in range(n_frames):
+        # 获取当前帧的数据
+        frame_points = points_np[frame_idx].reshape(-1, 3)  # (H*W, 3)
+        frame_mask = mask_sequence[frame_idx]  # (mask_h, mask_w)
+        frame_intrinsic = intrinsic[frame_idx] if intrinsic.ndim == 3 else intrinsic  # (3, 3)
+        frame_extrinsic = extrinsic[frame_idx] if extrinsic.ndim == 3 else extrinsic  # (3, 4)
+        
+        # 根据配置选择3D点过滤方法
+        if strict_filtering:
+            valid_3d_mask = apply_strict_3d_filtering(frame_points)
+        else:
+            valid_3d_mask = np.linalg.norm(frame_points, axis=1) > 1e-6
+        
+        valid_3d_points = frame_points[valid_3d_mask]
+        
+        if len(valid_3d_points) == 0:
+            if frame_idx < 3:
+                logger.info(f"  帧{frame_idx}: 无有效3D点")
+            continue
+        
+        # 3D点投影到2D像素坐标
+        try:
+            if strict_filtering:
+                pixels_2d, depth_valid = project_3d_to_2d_precise(valid_3d_points, frame_intrinsic, frame_extrinsic)
+            else:
+                pixels_2d, depth_valid = project_3d_to_2d(valid_3d_points, frame_intrinsic, frame_extrinsic)
+            
+            # 同时满足深度有效的点
+            depth_valid_points = valid_3d_points[depth_valid]
+            depth_valid_pixels = pixels_2d[depth_valid]
+            
+            if len(depth_valid_points) == 0:
+                if frame_idx < 3:
+                    logger.info(f"  帧{frame_idx}: 无深度有效点")
+                continue
+            
+            # 精确的像素坐标变换和边界检查
+            u_coords, v_coords = transform_coords_precisely(depth_valid_pixels, W, H, mask_w, mask_h)
+            
+            # 根据配置应用边界检查
+            if strict_filtering:
+                in_bounds = ((u_coords >= pixel_margin) & (u_coords < mask_w - pixel_margin) & 
+                           (v_coords >= pixel_margin) & (v_coords < mask_h - pixel_margin))
+            else:
+                in_bounds = ((u_coords >= 0) & (u_coords < mask_w) & 
+                           (v_coords >= 0) & (v_coords < mask_h))
+            
+            bounded_points = depth_valid_points[in_bounds]
+            bounded_u = u_coords[in_bounds]
+            bounded_v = v_coords[in_bounds]
+            
+            if len(bounded_points) == 0:
+                if frame_idx < 3:
+                    logger.info(f"  帧{frame_idx}: 无边界内点")
+                continue
+            
+            # 根据配置选择白色区域检查方法
+            if strict_filtering:
+                white_region_mask = check_white_region_with_neighborhood(
+                    frame_mask, bounded_u, bounded_v, mask_threshold
+                )
+            else:
+                # 简单检查
+                mask_values = frame_mask[bounded_v, bounded_u]
+                white_region_mask = mask_values > mask_threshold
+            
+            # 提取在白色区域的3D点
+            white_region_points = bounded_points[white_region_mask]
+            
+            if len(white_region_points) > 0:
+                # 根据配置应用空间一致性过滤
+                if strict_filtering:
+                    filtered_points = apply_spatial_consistency_filter(white_region_points)
+                else:
+                    filtered_points = white_region_points
+                
+                if len(filtered_points) > 0:
+                    intersection_points.append(filtered_points)
+                    
+                    # 提取对应的颜色（需要重新计算索引）
+                    frame_start = frame_idx * H * W
+                    valid_indices = np.where(valid_3d_mask)[0]
+                    depth_valid_indices = valid_indices[depth_valid]
+                    bounded_indices = depth_valid_indices[in_bounds]
+                    white_indices = bounded_indices[white_region_mask]
+                    
+                    # 对于过滤后的点，需要找到对应的索引
+                    if len(filtered_points) < len(white_region_points):
+                        # 找到过滤后点在原白色区域点中的索引
+                        kept_indices = find_kept_point_indices(white_region_points, filtered_points)
+                        white_indices = white_indices[kept_indices]
+                    
+                    absolute_indices = frame_start + white_indices
+                    frame_colors = colors_flat[absolute_indices]
+                    intersection_colors.append(frame_colors)
+                    intersection_indices.extend(absolute_indices)
+            
+            frame_intersection_count = len(filtered_points) if 'filtered_points' in locals() and len(filtered_points) > 0 else 0
+            valid_count = len(valid_3d_points)
+            projected_count = len(depth_valid_points)
+            bounded_count = len(bounded_points)
+            raw_white_count = len(white_region_points) if len(white_region_points) > 0 else 0
+            
+            if frame_idx < 3:  # 显示前3帧的统计
+                logger.info(f"  帧{frame_idx}: 有效3D点={valid_count}, 投影成功={projected_count}, 边界内={bounded_count}, 原始白色={raw_white_count}, 过滤后={frame_intersection_count}")
+                
+        except Exception as e:
+            logger.warning(f"  帧{frame_idx}: 投影失败 - {e}")
+            continue
+    
+    # 7. 合并所有帧的交集结果
+    if intersection_points:
+        final_intersected_points = np.vstack(intersection_points)
+        final_intersected_colors = np.vstack(intersection_colors)
+    else:
+        final_intersected_points = np.array([]).reshape(0, 3)
+        final_intersected_colors = np.array([]).reshape(0, 3)
+    
+    # 8. 根据配置应用全局空间过滤
+    if strict_filtering and len(final_intersected_points) > 0:
+        final_intersected_points, final_intersected_colors = apply_global_outlier_removal(
+            final_intersected_points, final_intersected_colors, outlier_factor
+        )
+    
+    # 创建完整的intersection_mask
+    total_points = np.prod(original_shape[:3])  # S * H * W
+    intersection_mask = np.zeros(total_points, dtype=bool)
+    if intersection_indices and len(final_intersected_points) > 0:
+        # 重新计算索引（如果有全局过滤）
+        valid_intersection_indices = intersection_indices[:len(final_intersected_points)]
+        intersection_mask[valid_intersection_indices] = True
+    
+    total_intersection = len(final_intersected_points)
+    intersection_ratio = total_intersection / total_points * 100 if total_points > 0 else 0
+    
+    filtering_mode = "严格过滤" if strict_filtering else "标准过滤"
+    logger.info(f"🎯 基于3D投影的{filtering_mode}交集计算完成:")
+    logger.info(f"  原始过滤点云: {total_points} 个点")
+    logger.info(f"  交集结果: {total_intersection} 个点 ({intersection_ratio:.1f}%)")
+    logger.info(f"  方法: 3D点坐标 + 相机参数 → 2D像素坐标 → {filtering_mode}mask白色区域判断")
+    
+    return final_intersected_points, final_intersected_colors, intersection_mask
 
 def extract_colors_from_filtered_result(filtered_vggt_result: Dict, original_shape: tuple) -> np.ndarray:
     """从过滤后的VGGT结果中提取颜色信息"""
@@ -205,12 +563,196 @@ def determine_white_threshold(mask_sequence: List[np.ndarray]) -> float:
         # 0-255范围的mask
         return 127
 
+def determine_strict_white_threshold(mask_sequence: List[np.ndarray]) -> float:
+    """确定严格的白色区域阈值：只保留纯白色"""
+    all_values = set()
+    for mask in mask_sequence[:3]:  # 只检查前3帧
+        all_values.update(np.unique(mask))
+    
+    logger.info(f"Mask唯一值: {sorted(list(all_values))}")
+    
+    max_val = max(all_values) if all_values else 255
+    if max_val <= 1.0:
+        # 0-1范围的mask：只要接近1的值
+        return 0.9
+    elif len(all_values) == 2 and 0 in all_values:
+        # 二值mask：只要最大值
+        non_zero_vals = [v for v in all_values if v > 0]
+        return max(non_zero_vals) - 1 if non_zero_vals else 254
+    else:
+        # 0-255范围的mask：只要接近255的值
+        return 250
+
+def apply_strict_3d_filtering(points: np.ndarray) -> np.ndarray:
+    """严格过滤3D点：排除异常值和离群点"""
+    # 基本非零过滤
+    norms = np.linalg.norm(points, axis=1)
+    valid_mask = norms > 1e-6
+    
+    if np.sum(valid_mask) == 0:
+        return valid_mask
+    
+    # 排除极端距离的点
+    valid_norms = norms[valid_mask]
+    
+    # 使用四分位数方法排除离群点
+    q1, q3 = np.percentile(valid_norms, [25, 75])
+    iqr = q3 - q1
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+    
+    # 应用距离过滤到所有点
+    distance_valid = (norms >= lower_bound) & (norms <= upper_bound)
+    
+    # 组合过滤条件
+    final_mask = valid_mask & distance_valid
+    
+    return final_mask
+
+def project_3d_to_2d_precise(points_3d: np.ndarray, intrinsic: np.ndarray, extrinsic: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    精确的3D到2D投影，增加数值稳定性
+    """
+    # 转换为齐次坐标
+    points_3d_homo = np.hstack([points_3d, np.ones((points_3d.shape[0], 1))])  # (N, 4)
+    
+    # 世界坐标 → 相机坐标
+    camera_coords = (extrinsic @ points_3d_homo.T).T  # (N, 3)
+    
+    # 严格的深度过滤：排除相机后方和过近的点
+    valid_depth = (camera_coords[:, 2] > 0.1)  # 最小深度0.1
+    
+    # 相机坐标 → 像素坐标
+    pixels_homo = (intrinsic @ camera_coords.T).T  # (N, 3)
+    
+    # 避免除零：检查z坐标
+    z_coords = pixels_homo[:, 2]
+    z_valid = np.abs(z_coords) > 1e-8
+    valid_depth = valid_depth & z_valid
+    
+    # 归一化得到像素坐标
+    pixels_2d = np.zeros((len(points_3d), 2))
+    if np.any(valid_depth):
+        pixels_2d[valid_depth] = pixels_homo[valid_depth, :2] / pixels_homo[valid_depth, 2:3]
+    
+    return pixels_2d, valid_depth
+
+def transform_coords_precisely(pixels_2d: np.ndarray, src_w: int, src_h: int, 
+                             dst_w: int, dst_h: int) -> Tuple[np.ndarray, np.ndarray]:
+    """精确的坐标变换"""
+    u_coords = pixels_2d[:, 0]
+    v_coords = pixels_2d[:, 1]
+    
+    # 如果分辨率不同，精确缩放
+    if dst_w != src_w or dst_h != src_h:
+        u_coords = u_coords * (dst_w / src_w)
+        v_coords = v_coords * (dst_h / src_h)
+    
+    # 四舍五入到最近的整数像素
+    u_coords = np.round(u_coords).astype(int)
+    v_coords = np.round(v_coords).astype(int)
+    
+    return u_coords, v_coords
+
+def check_white_region_with_neighborhood(mask: np.ndarray, u_coords: np.ndarray, 
+                                       v_coords: np.ndarray, threshold: float) -> np.ndarray:
+    """检查像素及其邻域是否在白色区域"""
+    white_mask = np.zeros(len(u_coords), dtype=bool)
+    
+    for i, (u, v) in enumerate(zip(u_coords, v_coords)):
+        # 检查中心像素
+        center_value = mask[v, u]
+        
+        if center_value > threshold:
+            # 检查3x3邻域的一致性
+            neighbor_values = []
+            for dv in [-1, 0, 1]:
+                for du in [-1, 0, 1]:
+                    nv, nu = v + dv, u + du
+                    if 0 <= nv < mask.shape[0] and 0 <= nu < mask.shape[1]:
+                        neighbor_values.append(mask[nv, nu])
+            
+            if neighbor_values:
+                # 要求邻域中至少50%的像素也是白色
+                white_neighbors = np.sum(np.array(neighbor_values) > threshold)
+                if white_neighbors >= len(neighbor_values) * 0.5:
+                    white_mask[i] = True
+    
+    return white_mask
+
+def apply_spatial_consistency_filter(points: np.ndarray, max_distance: float = 0.5) -> np.ndarray:
+    """应用空间一致性过滤：移除孤立的离群点"""
+    if len(points) < 10:  # 点太少，不过滤
+        return points
+    
+    from scipy.spatial.distance import pdist, squareform
+    
+    try:
+        # 计算点间距离矩阵
+        distances = squareform(pdist(points))
+        
+        # 对每个点，计算其邻近点的数量
+        neighbor_counts = np.sum(distances < max_distance, axis=1) - 1  # 排除自己
+        
+        # 保留有足够邻近点的点
+        min_neighbors = max(1, len(points) // 20)  # 至少1个邻居，或总数的5%
+        valid_mask = neighbor_counts >= min_neighbors
+        
+        return points[valid_mask]
+        
+    except ImportError:
+        logger.warning("scipy不可用，跳过空间一致性过滤")
+        return points
+    except Exception as e:
+        logger.warning(f"空间一致性过滤失败: {e}")
+        return points
+
+def apply_global_outlier_removal(points: np.ndarray, colors: np.ndarray, 
+                                outlier_factor: float = 1.5) -> Tuple[np.ndarray, np.ndarray]:
+    """全局离群点移除"""
+    if len(points) < 50:  # 点太少，不过滤
+        return points, colors
+    
+    try:
+        # 计算点云中心和距离
+        center = np.mean(points, axis=0)
+        distances = np.linalg.norm(points - center, axis=1)
+        
+        # 使用四分位数方法识别离群点
+        q1, q3 = np.percentile(distances, [25, 75])
+        iqr = q3 - q1
+        upper_bound = q3 + outlier_factor * iqr
+        
+        # 保留非离群点
+        inlier_mask = distances <= upper_bound
+        
+        return points[inlier_mask], colors[inlier_mask]
+        
+    except Exception as e:
+        logger.warning(f"全局离群点移除失败: {e}")
+        return points, colors
+
+def find_kept_point_indices(original_points: np.ndarray, kept_points: np.ndarray) -> np.ndarray:
+    """找到保留点在原始点集中的索引"""
+    if len(kept_points) == 0:
+        return np.array([], dtype=int)
+    
+    # 对于每个保留的点，找到在原始点集中的索引
+    indices = []
+    for kept_point in kept_points:
+        # 找到最接近的原始点
+        distances = np.linalg.norm(original_points - kept_point, axis=1)
+        closest_idx = np.argmin(distances)
+        indices.append(closest_idx)
+    
+    return np.array(indices)
+
 # -----------------------------------------------------------------------------
 # 主要节点实现
 # -----------------------------------------------------------------------------
 
 class VGGTMaskProcessorNode:
-    """VGGT Mask处理节点 - 计算过滤后点云与mask白色区域的交集"""
+    """VGGT Mask处理节点 - 基于3D投影计算过滤后点云与mask白色区域的交集"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -227,6 +769,18 @@ class VGGTMaskProcessorNode:
                 "export_format": (["PLY", "GLB", "BOTH"], {
                     "default": "PLY",
                     "tooltip": "导出格式：PLY(点云)、GLB(网格)或两者都导出"
+                }),
+                "strict_filtering": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "启用严格过滤：减少散点和mask外点"
+                }),
+                "pixel_margin": ("INT", {
+                    "default": 2, "min": 0, "max": 10, "step": 1,
+                    "tooltip": "像素边距：增加边界安全距离"
+                }),
+                "outlier_factor": ("FLOAT", {
+                    "default": 0.5, "min": 0.1, "max": 3.0, "step": 0.1,
+                    "tooltip": "离群点过滤系数：值越小过滤越严格"
                 }),
             }
         }
@@ -254,17 +808,21 @@ class VGGTMaskProcessorNode:
     CATEGORY = "💃VVL/VGGT Mask"
 
     def process_intersection(self, filtered_vggt_result: Dict, mask_sequence,
-                           export_format: str = "PLY"):
-        """处理点云与mask的交集"""
-        logger.info("开始VGGT点云与mask交集处理")
+                           export_format: str = "PLY",
+                           strict_filtering: bool = True,
+                           pixel_margin: int = 2,
+                           outlier_factor: float = 1.5):
+        """使用3D投影方法处理点云与mask的交集"""
+        logger.info("开始基于3D投影的VGGT点云与mask交集处理")
+        logger.info(f"严格过滤: {strict_filtering}, 像素边距: {pixel_margin}, 离群点系数: {outlier_factor}")
         
         try:
             # 处理mask序列输入
             mask_list = self._process_mask_sequence(mask_sequence)
             
-            # 计算交集
-            intersected_points, intersected_colors, intersection_mask = compute_pointcloud_mask_intersection(
-                filtered_vggt_result, mask_list
+            # 🎯 使用新的3D投影算法计算交集
+            intersected_points, intersected_colors, intersection_mask = compute_3d_projection_mask_intersection_configurable(
+                filtered_vggt_result, mask_list, strict_filtering, pixel_margin, outlier_factor
             )
             
             # 生成统计信息
@@ -275,7 +833,8 @@ class VGGTMaskProcessorNode:
             stats = {
                 "total_intersection_points": int(intersection_count),
                 "total_points": int(total_points),
-                "method": "filtered_pointcloud_intersect_mask_white_regions",
+                "method": "3d_projection_to_2d_pixels_mask_intersection",
+                "algorithm": "3D_coordinates + camera_parameters → 2D_pixels → mask_white_region_check",
                 "intersection_ratio": float(intersection_ratio)
             }
             stats_json = json.dumps(stats, ensure_ascii=False, indent=2)
@@ -294,7 +853,7 @@ class VGGTMaskProcessorNode:
             glb_path = ""
             
             if len(intersected_points) == 0:
-                logger.warning("交集为空，无法导出文件")
+                logger.warning("3D投影交集为空，无法导出文件")
             else:
                 if export_format in ["PLY", "BOTH"]:
                     ply_path = self._export_intersection_ply(
@@ -309,9 +868,10 @@ class VGGTMaskProcessorNode:
             
             # 生成处理报告
             report = {
-                "processing_method": "pointcloud_mask_intersection",
+                "processing_method": "3d_projection_mask_intersection",
                 "input_source": "filtered_vggt_result",
-                "intersection_algorithm": "pixel_level_correspondence",
+                "intersection_algorithm": "3D_to_2D_projection_with_camera_parameters",
+                "geometric_method": "intrinsic_extrinsic_matrix_projection",
                 "statistics": stats,
                 "output_files": {
                     "ply_file": ply_path,
@@ -322,15 +882,15 @@ class VGGTMaskProcessorNode:
             }
             report_json = json.dumps(report, ensure_ascii=False, indent=2)
             
-            logger.info("VGGT点云与mask交集处理完成")
+            logger.info("基于3D投影的VGGT点云与mask交集处理完成")
             return (stats_json, ply_path, glb_path, report_json)
             
         except Exception as e:
-            logger.error(f"交集处理失败: {e}")
+            logger.error(f"3D投影交集处理失败: {e}")
             import traceback
             traceback.print_exc()
             
-            error_msg = f"交集处理失败: {str(e)}"
+            error_msg = f"3D投影交集处理失败: {str(e)}"
             error_json = json.dumps({"error": str(e)})
             return (error_json, "", "", error_msg)
     
@@ -538,5 +1098,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "VGGTMaskProcessorNode": "🎭 VGGT Intersection Processor",
+    "VGGTMaskProcessorNode": "🎯 VGGT 3D Projection Processor",
 } 
